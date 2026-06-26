@@ -1,0 +1,3 @@
+# Python 缓存（dist/setup.py 是发布产物，必须提交，不要忽略）
+__pycache__/
+*.pyc

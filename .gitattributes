@@ -1,0 +1,3 @@
+# 统一 LF：保证 dist/setup.py 在任何机器/平台上字节一致，
+# 与 build.py 算出的 SHA256 相符（jsDelivr 提供的就是仓库里的字节）。
+* text=auto eol=lf
