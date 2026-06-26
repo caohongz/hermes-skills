@@ -1,78 +1,74 @@
 # hermes-skills
 
-给 [hermes-app](https://github.com/caohongz/hermes-app) 用的、发布到公网（GitHub + jsDelivr）、由 **Hermes 自己下载安装**的 skill。
+给 [hermes-app](https://github.com/caohongz/hermes-app) 用的、发布到公网、由 **Hermes 框架原生安装**的 skill（遵循 [agentskills.io](https://agentskills.io) 开放标准）。
 
 当前 skill：**`hermes-app-gateway`** —— 一个 skill 一键铺好 app 所需的整套后端：网络侦测 + 认证代理层 + 用户管理 + 助手管理。
 
----
+## 设计原则：把 LLM 从关键路径上拿掉
 
-## 设计原则：LLM 只在"安装那一次"出现
+终端用户拿到 app 后只填**网关地址**就能用，运行时全走确定性 HTTP，不过大模型。而安装/部署这步——
 
-终端用户拿到 app 后只填**网关地址**就能用。登录、用户管理、助手管理、收发消息**全部走确定性的 HTTP 网关**，一个字都不过大模型。只有"首次安装/配对"这一步借助 Hermes agent（它在主机上、有文件 + shell 工具）完成。这样把"模型不可靠"的暴露面压缩到字面意义上的一次安装。
+- **安装 skill**：由 Hermes 框架完成（下载 + 安全扫描 + 落盘），**不经过 agent 模型**。
+- **部署网关**：owner 手动跑一条命令，**也不经过 agent 模型**。
 
+模型保守不保守，都不影响你装上、跑起来。
+
+## 安装（owner 一次性）
+
+在 Hermes 主机上，让框架安装 skill：
+
+```bash
+hermes skills install caohongz/hermes-skills/hermes-app-gateway
 ```
-阶段 0 安装（你，一次，在 app 之外）
-  你 ──对话──> Hermes（CLI/dashboard/Telegram 任一入口）
-      发 INSTALL-PROMPT.md 里的提示词
-  Hermes agent ──> 下载 dist/setup.py → 校验 SHA256 → 落盘 → 跑 install
-      ↓ 返回 [[HAM:BEGIN]]{...owner_claim_token...}[[HAM:END]]
 
-阶段 1 认领（你，在 app 里，一次）
-  app 注册时带 owner_claim_token → 你成为管理员，自动关闭开放注册
+> 路径格式 `<github-owner>/<repo>/<skill-path>` 按 Hermes 文档推断。若框架不识别，先用 `hermes skills browse` / `hermes skills search` 查正确写法。
 
-阶段 2 日常（终端用户，永远只到这层）
-  app 只填 [网关地址] ──HTTP──> 网关 → 注册/登录 → 用所有功能
+然后部署网关（推荐你手动跑，最稳）：
+
+```bash
+python3 ~/.hermes/skills/hermes-app-gateway/scripts/setup.py install
 ```
+
+`install` 会打印 `[[HAM:BEGIN]]{...owner_claim_token...}[[HAM:END]]`。记下 `owner_claim_token` / `port` / `local_ip`，去 app 注册时填令牌即成管理员（并自动关闭开放注册）。
+
+## 为什么这样可信
+
+- **明文可审计**：`scripts/` 下 `gateway.py` / `provision.py` / `setup.py` 全是明文，agent、框架扫描、你本人都能逐行看。无 base64、无"下载未知脚本执行"。
+- **框架安装**：`hermes skills install` 由框架下载 + security-scan + 落盘，不依赖 agent 判断。
+- **master key 不出服务器**：`install` 在本机读 `~/.hermes/.env` 注入网关，客户端只拿 JWT。
+- **可核对**：`manifest.json` 列出各文件 SHA256，owner 可手动核对。
 
 ## 目录结构
 
 ```
-src/
-  gateway.py       认证代理网关（JWT + 用户管理 + 会话隔离 + 助手管理 + /health + owner 令牌）
-  provision.py     助手 provisioner（每个助手 = 独立 profile + 独立常驻网关）
-  setup_main.py    skill 入口：detect / status / install / restart / stop / info
-build.py           把 src/* 打包成单文件 dist/setup.py，并算 SHA256
-dist/
-  setup.py         发布产物（gateway/provision 以 base64 内嵌，hermes 只下载这一个文件）
-  manifest.json    { name, skill_version, entry, sha256, size }
+hermes-app-gateway/          # skill 包（hermes skills install 拉取它）
+├── SKILL.md                 # agentskills 标准：frontmatter + 指令
+├── manifest.json            # 各文件 SHA256（供手动核对）
+└── scripts/
+    ├── setup.py             # 入口：install/status/detect/restart/stop/info
+    ├── gateway.py           # 认证代理网关（明文）
+    └── provision.py         # 助手 provisioner（明文）
+build.py                     # 规范化 LF + 刷新 manifest
 ```
 
-## 开发 → 构建 → 发布
+## 开发 → 发布
 
 ```bash
-# 1. 改 src/ 里的源码
-# 2. 重新打包并算哈希
-python build.py
-# 3. 提交并打一个【不可变】tag（务必用 tag，不要用分支名）
-git add -A && git commit -m "skill vN"
-git tag vN && git push && git push --tags
+# 改 hermes-app-gateway/scripts/ 或 SKILL.md
+python build.py                       # 规范化 LF + 刷新 manifest.json
+git add -A && git commit -m "..."
+git push                              # 提交即生效（hermes skills install 从 GitHub 拉）
 ```
-
-发布后 jsDelivr 永久指向该 tag 的字节：
-
-```
-https://cdn.jsdelivr.net/gh/caohongz/hermes-skills@vN/dist/setup.py
-```
-
-> ⚠️ jsDelivr 用 `@vN`（tag）或 `@<commit>` 才不可变；`@main` 有缓存且会变，**绝不能**用来配哈希校验。
-
-## 安全模型（为什么这样就安全）
-
-- **完整性**：发布时 `build.py` 算出 `dist/setup.py` 的 SHA256。安装提示词里**硬编码**这个哈希，经"你 → Hermes"这条可信通道传达；Hermes 下载公网文件后校验，**先校验、通过才落盘执行**（避免 TOCTOU）。能挡公网投毒、传输篡改、版本错配。
-- **信任根在两端、都在你手里**：Hermes 端靠提示词里带的哈希；app 端靠**出厂内置**的期望哈希/版本（查网关 `/health` 的 `version` 比对，绝不采信网关自报）。
-- **master key 不出服务器**：`install` 在主机本地读 `~/.hermes/.env` 的 `API_SERVER_KEY` 注入网关，app 永远拿不到它。
-- **托管平台无需可信**：有哈希校验兜底，jsDelivr 只管"放文件"。
-- 边界：哈希校验**挡不住"服务器被拿到 root"**（沦陷主机可自报正确哈希却跑改过的代码）。那一层要靠最小权限 / 外部监控，不在本 skill 范围。
+版本化：同步升 `SKILL.md` 的 `version` 与 `scripts/setup.py` 的 `SKILL_VERSION`。
 
 ## skill 动作
 
 | 动作 | 说明 |
 |---|---|
-| `status` | 探测网关是否安装 / 在跑 / 版本 / 端口 |
-| `detect` | 侦测网络（本地IP / 公网IP / NAT / hermes 是否在跑），用于配对建议 |
-| `install` | 写网关+provisioner、装依赖、注入 master key、生成 JWT 密钥与 owner 一次性令牌、起常驻进程、`/health` 自检；返回连接信息 + `owner_claim_token` |
-| `restart` | 重启网关进程（NAS 重启后恢复用）|
-| `stop` | 停止网关进程 |
-| `info` | 返回连接信息（地址/端口/版本/是否已认领 owner）|
+| `install` | 复制网关+provisioner、装依赖、注入 master key、生成 JWT 密钥与 owner 令牌、起常驻进程、`/health` 自检 |
+| `status` | 探测装没装 / 在跑否 / 版本 / 端口 |
+| `detect` | 网络侦测（本地IP/公网IP/NAT/hermes 是否在跑）|
+| `restart` / `stop` | 生命周期（NAS 重启后恢复 / 省内存）|
+| `info` | 连接信息 + owner 状态 |
 
-完整安装提示词见 [INSTALL-PROMPT.md](INSTALL-PROMPT.md)。
+详细步骤见 [INSTALL-PROMPT.md](INSTALL-PROMPT.md)。

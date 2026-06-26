@@ -1,7 +1,0 @@
-{
-  "name": "hermes-app-gateway",
-  "skill_version": 1,
-  "entry": "setup.py",
-  "sha256": "c1734781eaf96d5aef279ccd0d163a9dcc6571890dd0baa2a218f2ed3a524059",
-  "size": 66281
-}

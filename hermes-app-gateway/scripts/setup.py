@@ -1,26 +1,26 @@
 #!/usr/bin/env python3
-"""hermes-app-gateway skill —— 一键在 Hermes 主机上部署/管理"统一网关"。
+"""hermes-app-gateway skill —— 在 Hermes 主机上部署/管理"统一网关"。
 
-这是 hermes-skills 的发布产物入口（dist/setup.py 的源）。它把认证代理网关
-(gateway.py) 与助手 provisioner(provision.py) 内嵌为 base64，install 时落盘
-并起常驻进程。运行时的登录/用户/助手/会话全部走网关 HTTP，不再经过 LLM。
+明文 skill：本目录(scripts/)下的 gateway.py / provision.py 都是可逐行审计的明文源码，
+install 时把它们复制到运行位置并起常驻进程。运行时的登录/用户/助手/会话全部走网关
+HTTP，不再经过 LLM。
 
 每个动作打印 [[HAM:BEGIN]]{json}[[HAM:END]]，供 app / 你解析。
 
 动作：
   status   探测网关是否安装 / 在跑 / 版本 / 端口
   detect   侦测网络环境（本地IP / 公网IP / NAT / hermes 是否在跑）
-  install  写网关+provisioner、装依赖、注入 master key、生成 JWT 密钥与
+  install  复制网关+provisioner、装依赖、注入 master key、生成 JWT 密钥与
            owner 一次性认领令牌、起常驻进程、/health 自检；返回连接信息
   restart  重启网关进程
   stop     停止网关进程
   info     返回连接信息（地址/端口/版本/是否已认领 owner）
 """
-import base64, json, os, signal, socket, subprocess, sys, time
+import json, os, signal, socket, subprocess, sys, time
 import urllib.request, urllib.error
 from pathlib import Path
 
-# 确保 stdout 为 UTF-8：HAM 结果可能含中文错误信息，避免在非 UTF-8 终端崩溃
+# 确保 stdout 为 UTF-8：HAM 结果可能含中文，避免在非 UTF-8 终端崩溃
 try:
     sys.stdout.reconfigure(encoding="utf-8")
 except Exception:
@@ -29,9 +29,10 @@ except Exception:
 SKILL_VERSION = 1
 GATEWAY_VERSION = "2.0.0"
 
-# 由 build.py 注入（base64，避免内嵌源码的引号/反斜杠/三引号转义问题）
-GATEWAY_PY_B64 = "__GATEWAY_PY_B64__"
-PROVISION_PY_B64 = "__PROVISION_PY_B64__"
+# 本 skill 自带的明文源码（与本文件同目录），install 时复制到运行位置
+SCRIPT_DIR = Path(__file__).resolve().parent
+GATEWAY_SRC = SCRIPT_DIR / "gateway.py"
+PROVISION_SRC = SCRIPT_DIR / "provision.py"
 
 GW_DIR = Path.home() / ".hermes-gateway"
 GW_SCRIPT = GW_DIR / "hermes_gateway.py"
@@ -51,10 +52,6 @@ def emit(o):
 
 def fail(m):
     emit({"ok": False, "error": str(m)})
-
-
-def _decode(b64):
-    return base64.b64decode(b64.encode()).decode("utf-8")
 
 
 def load_config():
@@ -242,10 +239,12 @@ def act_detect():
 
 def act_install():
     GW_DIR.mkdir(parents=True, exist_ok=True)
-    # 1) 落盘网关 + provisioner
-    GW_SCRIPT.write_text(_decode(GATEWAY_PY_B64), encoding="utf-8")
+    # 1) 复制网关 + provisioner（从本 skill scripts/ 下的明文源）
+    if not GATEWAY_SRC.exists() or not PROVISION_SRC.exists():
+        fail("skill 不完整：scripts/ 下缺少 gateway.py 或 provision.py")
+    GW_SCRIPT.write_text(GATEWAY_SRC.read_text(encoding="utf-8"), encoding="utf-8")
     PROVISION_PATH.parent.mkdir(parents=True, exist_ok=True)
-    PROVISION_PATH.write_text(_decode(PROVISION_PY_B64), encoding="utf-8")
+    PROVISION_PATH.write_text(PROVISION_SRC.read_text(encoding="utf-8"), encoding="utf-8")
     try:
         os.chmod(GW_SCRIPT, 0o755)
         os.chmod(PROVISION_PATH, 0o755)
