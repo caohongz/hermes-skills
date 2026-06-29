@@ -135,23 +135,39 @@ def read_master_key():
     return ""
 
 
+PYPI_MIRROR = "https://pypi.tuna.tsinghua.edu.cn/simple"
+
+
+def _can_import(mod):
+    """用将来跑网关的同一解释器、以子进程方式确认模块可导入（最可靠）。"""
+    return subprocess.run([sys.executable, "-c", "import " + mod],
+                          capture_output=True).returncode == 0
+
+
+def _pip_install(pkgs, mirror=None):
+    cmd = [sys.executable, "-m", "pip", "install", "--user", *pkgs]
+    if mirror:
+        cmd += ["-i", mirror]
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
 def _ensure_deps():
-    """缺啥装啥（装到当前解释器，确保与跑网关的 python 一致）；bcrypt 可选。"""
-    need = {"flask": "flask", "flask_cors": "flask-cors", "jwt": "pyjwt", "requests": "requests"}
-    missing = []
-    for mod, pkg in need.items():
-        try:
-            __import__(mod)
-        except Exception:
-            missing.append(pkg)
+    """装必需依赖；默认源失败自动换国内镜像；最终仍缺则用明确错误中止（不再静默）。bcrypt 可选。"""
+    required = {"flask": "flask", "flask_cors": "flask-cors", "jwt": "pyjwt", "requests": "requests"}
+    missing = [pkg for mod, pkg in required.items() if not _can_import(mod)]
     if missing:
-        subprocess.run([sys.executable, "-m", "pip", "install", "--user", *missing],
-                       capture_output=True, text=True)
-    try:
-        __import__("bcrypt")
-    except Exception:
-        subprocess.run([sys.executable, "-m", "pip", "install", "--user", "bcrypt"],
-                       capture_output=True, text=True)
+        _pip_install(missing)
+        if any(not _can_import(mod) for mod in required):  # 默认源没装全 → 换国内镜像重试
+            _pip_install(missing, PYPI_MIRROR)
+    still = [pkg for mod, pkg in required.items() if not _can_import(mod)]
+    if still:
+        fail("依赖安装失败，缺少 " + ", ".join(still)
+             + "。请手动安装后重试： python3 -m pip install --user -i "
+             + PYPI_MIRROR + " " + " ".join(still))
+    # bcrypt 可选（C 扩展，装不上会自动回退到标准库 pbkdf2）
+    if not _can_import("bcrypt"):
+        if _pip_install(["bcrypt"]).returncode != 0:
+            _pip_install(["bcrypt"], PYPI_MIRROR)
 
 
 def _stop_gateway():

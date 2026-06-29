@@ -2,8 +2,8 @@
   "name": "hermes-app-gateway",
   "skill_version": 1,
   "files": {
-    "SKILL.md": "59694a87b7c3514251db3c7aa6cbc59d857e0306fc3ce71743e01b94bc93786a",
-    "scripts/setup.py": "8eedacef0f4e3cefeda5a1618b415e1e3978a0c2636eee288d17c0b30d2c4860",
+    "SKILL.md": "b6c7ad3dd5380c424421405d5a5f5d39a089528c0281e1334a4468a848201d74",
+    "scripts/setup.py": "c3965bd9faccb181860268a4c1662a9c8acbde23700c93d6d3b2d1da4d7a53be",
     "scripts/gateway.py": "429995dec2e488e074f237afd08f5af8e8c67348f93b179507791c3b658fff96",
     "scripts/provision.py": "266fc474ab660f6ab6087fe41c5f34512f1273dd530dcb3ded2e19fb6405342c"
   }
