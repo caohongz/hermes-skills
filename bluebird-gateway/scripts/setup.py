@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""hermes-app-gateway skill —— 在 Hermes 主机上部署/管理"统一网关"。
+"""bluebird-gateway skill —— 在 Hermes 主机上部署/管理"统一网关"。
 
 明文 skill：本目录(scripts/)下的 gateway.py / provision.py 都是可逐行审计的明文源码，
 install 时把它们复制到运行位置并起常驻进程。运行时的登录/用户/助手/会话全部走网关

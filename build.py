@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """规范化 skill 文件为 LF，并生成 manifest.json（各文件 SHA256，供手动核对/版本追溯）。
 
-明文 skill：hermes-app-gateway/ 下就是最终内容，无需打包。本脚本只做两件事：
+明文 skill：bluebird-gateway/ 下就是最终内容，无需打包。本脚本只做两件事：
 1) 把所有文本文件统一为 LF（保证跨平台字节稳定，与 GitHub/jsDelivr 一致）
-2) 算每个文件的 SHA256，写 hermes-app-gateway/manifest.json
+2) 算每个文件的 SHA256，写 bluebird-gateway/manifest.json
 
-安装由 Hermes 框架完成：`hermes skills install caohongz/hermes-skills/hermes-app-gateway`
+安装由 Hermes 框架完成：`hermes skills install caohongz/hermes-skills/bluebird-gateway`
 （框架下载 + 安全扫描 + 落盘，不经过 LLM）。manifest.json 仅供 owner 手动核对。
 """
 import hashlib
@@ -20,7 +20,7 @@ except Exception:
     pass
 
 ROOT = Path(__file__).resolve().parent
-SKILL = ROOT / "hermes-app-gateway"
+SKILL = ROOT / "bluebird-gateway"
 
 # 纳入 manifest 的文件（相对 SKILL 目录）；manifest.json 自身不纳入（避免自引用）
 FILES = ["SKILL.md", "scripts/setup.py", "scripts/gateway.py", "scripts/provision.py"]
@@ -42,7 +42,7 @@ def main():
     version = int(m.group(1)) if m else 0
 
     manifest = {
-        "name": "hermes-app-gateway",
+        "name": "bluebird-gateway",
         "skill_version": version,
         "files": files,
     }

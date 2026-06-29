@@ -1,9 +1,9 @@
 {
-  "name": "hermes-app-gateway",
+  "name": "bluebird-gateway",
   "skill_version": 1,
   "files": {
-    "SKILL.md": "b6c7ad3dd5380c424421405d5a5f5d39a089528c0281e1334a4468a848201d74",
-    "scripts/setup.py": "c3965bd9faccb181860268a4c1662a9c8acbde23700c93d6d3b2d1da4d7a53be",
+    "SKILL.md": "ab9c3c7fad3e672ac0a3223dee927cf8c19adc7db512700d17b36186652b36a0",
+    "scripts/setup.py": "60088e2d6261c965ab9ffcf79f028f0fe855e2e6db05f5d528d042a8d53f4ec0",
     "scripts/gateway.py": "429995dec2e488e074f237afd08f5af8e8c67348f93b179507791c3b658fff96",
     "scripts/provision.py": "266fc474ab660f6ab6087fe41c5f34512f1273dd530dcb3ded2e19fb6405342c"
   }
