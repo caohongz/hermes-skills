@@ -45,7 +45,7 @@ PBKDF2_ITERATIONS = 200_000
 
 # 网关版本（单一事实源：app/status 经 /health 拿到的就是它；升级检测靠它比对）
 # 规则：凡改动 gateway.py 行为/结构就 +1；setup.py 不再重复硬编码，改为解析本常量。
-GATEWAY_VERSION = "2.1.0"
+GATEWAY_VERSION = "2.2.0"
 
 # ============ 配置 ============
 
@@ -70,6 +70,12 @@ class Config:
     # 留空则纯 HTTP（由前面的 Caddy/nginx/tailscale serve 负责 TLS）。
     SSL_CERTFILE = None
     SSL_KEYFILE = None
+    # 多用户授权加固（默认关闭，避免影响现有 app；按 SKILL.md 验证 app 请求结构后再开）：
+    #   enforce_session_ownership: /v1,/api 转发前，请求里出现的会话标识若在 sessions 表中
+    #     属于他人则 403（无法识别的标识放行，不破坏功能）。
+    #   api_allow_prefixes: 非空时 /api/* 仅放行这些路径前缀（白名单），其余 403。
+    ENFORCE_SESSION_OWNERSHIP = False
+    API_ALLOW_PREFIXES = []
 
     @classmethod
     def load(cls):
@@ -92,6 +98,8 @@ class Config:
                 cls.JWT_SECRET = config.get('jwt_secret')
                 cls.SSL_CERTFILE = config.get('ssl_certfile') or None
                 cls.SSL_KEYFILE = config.get('ssl_keyfile') or None
+                cls.ENFORCE_SESSION_OWNERSHIP = bool(config.get('enforce_session_ownership', False))
+                cls.API_ALLOW_PREFIXES = config.get('api_allow_prefixes') or []
 
         # 如果没有配置，尝试从环境变量读取
         if not cls.HERMES_API_KEY:
@@ -123,6 +131,8 @@ class Config:
             'jwt_secret': cls.JWT_SECRET,
             'ssl_certfile': cls.SSL_CERTFILE,
             'ssl_keyfile': cls.SSL_KEYFILE,
+            'enforce_session_ownership': cls.ENFORCE_SESSION_OWNERSHIP,
+            'api_allow_prefixes': cls.API_ALLOW_PREFIXES,
         }
         with open(cls.CONFIG_PATH, 'w') as f:
             json.dump(config, f, indent=2)
@@ -133,7 +143,7 @@ class Config:
 # 数据库结构版本：每次给「已存在的表」加列/改结构时 +1，并在 MIGRATIONS 登记对应迁移。
 # 约定：init_db 的 CREATE TABLE 永远反映「最新结构」；迁移只负责把历史库逐级升到最新。
 # 因此全新库（CREATE TABLE 已是最新）跑迁移应是幂等 no-op，迁移函数务必自带存在性检查。
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 def _column_exists(conn, table, column):
     """表里是否已有该列（供迁移做幂等判断）。"""
@@ -152,12 +162,13 @@ def _set_schema_version(conn, v):
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (str(v),))
 
 # 迁移登记表：{目标版本: 接收 conn 的函数}。函数必须幂等（自带列/表存在性检查），
-# 这样在全新库上重复执行也安全。示例（将在后续版本启用 token_version 吊销时填入）：
-#   def _mig_add_token_version(conn):
-#       if not _column_exists(conn, "users", "token_version"):
-#           conn.execute("ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0")
-#   MIGRATIONS = {2: _mig_add_token_version}
-MIGRATIONS = {}
+# 这样在全新库(CREATE TABLE 已是最新)上重复执行也安全。
+def _mig_add_token_version(conn):
+    """v2：users 加 token_version，用于令牌吊销（改密/登出/删号后旧 JWT 失效）。"""
+    if not _column_exists(conn, "users", "token_version"):
+        conn.execute("ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0")
+
+MIGRATIONS = {2: _mig_add_token_version}
 
 def run_migrations(conn):
     """把数据库结构从当前版本逐级升到 SCHEMA_VERSION；全新库与历史库都安全。"""
@@ -188,6 +199,7 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             last_login TIMESTAMP,
+            token_version INTEGER NOT NULL DEFAULT 0,   -- 令牌吊销基线：自增即令旧 JWT 失效
             FOREIGN KEY (created_by) REFERENCES users(id)
         )
     """)
@@ -318,17 +330,30 @@ def verify_password(password: str, stored: str) -> bool:
     legacy = hashlib.sha256(password.encode()).hexdigest()
     return hmac.compare_digest(legacy, stored)
 
+def _get_token_version(user_id: int) -> int:
+    """读取用户当前 token_version（吊销基线）；读不到按 0。"""
+    try:
+        conn = get_db()
+        row = conn.execute('SELECT token_version FROM users WHERE id = ?', (user_id,)).fetchone()
+        conn.close()
+        return int(row['token_version']) if row and row['token_version'] is not None else 0
+    except Exception:
+        return 0
+
 def generate_token(user_id: int) -> dict:
-    """生成 JWT Token"""
+    """生成 JWT Token（带 token_version，用于吊销校验）"""
     now = datetime.utcnow()
+    tv = _get_token_version(user_id)
     access_payload = {
         'user_id': user_id,
         'type': 'access',
+        'tv': tv,
         'exp': now + timedelta(days=Config.JWT_EXPIRE_DAYS)
     }
     refresh_payload = {
         'user_id': user_id,
         'type': 'refresh',
+        'tv': tv,
         'exp': now + timedelta(days=Config.JWT_EXPIRE_DAYS * 2)
     }
 
@@ -338,37 +363,50 @@ def generate_token(user_id: int) -> dict:
         'expires_at': int((now + timedelta(days=Config.JWT_EXPIRE_DAYS)).timestamp())
     }
 
-def verify_token(token: str, expected_type: str = None):
-    """验证 JWT Token 并返回 user_id。
-
-    expected_type 非空时，额外要求 payload['type'] 匹配（如 'refresh'），不匹配返回 None。
-    默认 None 保持旧行为（不校验 type），兼容现有调用方与已签发令牌。
-    """
+def _decode_token(token: str, expected_type: str = None):
+    """解码并验签 JWT，返回 payload(dict) 或 None。expected_type 非空时校验 type。"""
     try:
         payload = jwt.decode(token, Config.JWT_SECRET, algorithms=['HS256'])
         if expected_type is not None and payload.get('type') != expected_type:
             return None
-        return payload['user_id']
+        return payload
     except Exception:
         return None
 
+def verify_token(token: str, expected_type: str = None):
+    """验证 JWT 并返回 user_id（不含 token_version 吊销校验；那由调用方查库比对）。
+
+    默认 expected_type=None 保持旧行为（不校验 type），兼容现有调用方与已签发令牌。
+    """
+    payload = _decode_token(token, expected_type)
+    return payload.get('user_id') if payload else None
+
 def get_current_user():
-    """从请求中获取当前用户"""
+    """从请求中获取当前用户（含 token_version 吊销校验）"""
     auth_header = request.headers.get('Authorization', '')
     if not auth_header.startswith('Bearer '):
         return None
 
     token = auth_header[7:]
-    user_id = verify_token(token)
-
+    payload = _decode_token(token)
+    if not payload:
+        return None
+    user_id = payload.get('user_id')
     if not user_id:
         return None
 
     conn = get_db()
     user = conn.execute('SELECT * FROM users WHERE id = ?', (user_id,)).fetchone()
     conn.close()
+    if not user:
+        return None
 
-    return dict(user) if user else None
+    # token_version 吊销校验：令牌签发时的 tv 必须等于用户当前 tv（改密/登出后旧令牌立即失效）
+    cur_tv = user['token_version'] if 'token_version' in user.keys() and user['token_version'] is not None else 0
+    if int(payload.get('tv', 0)) != int(cur_tv):
+        return None
+
+    return dict(user)
 
 def require_auth(f):
     """装饰器：要求认证"""
@@ -518,16 +556,35 @@ def login():
 
 @app.route('/api/auth/refresh', methods=['POST'])
 def refresh():
-    """刷新 Token（仅接受 refresh 类型令牌；access 令牌不能用于续期）"""
+    """刷新 Token（仅接受 refresh 类型令牌；校验用户仍存在且 token_version 匹配）"""
     data = request.json
     refresh_token = data.get('refresh_token', '')
 
-    user_id = verify_token(refresh_token, expected_type='refresh')
-    if not user_id:
+    payload = _decode_token(refresh_token, expected_type='refresh')
+    if not payload:
+        return jsonify({'error': '无效的刷新令牌'}), 401
+    user_id = payload.get('user_id')
+
+    conn = get_db()
+    user = conn.execute('SELECT id, token_version FROM users WHERE id = ?', (user_id,)).fetchone()
+    conn.close()
+    cur_tv = user['token_version'] if user and user['token_version'] is not None else 0
+    if not user or int(payload.get('tv', 0)) != int(cur_tv):
         return jsonify({'error': '无效的刷新令牌'}), 401
 
     tokens = generate_token(user_id)
     return jsonify(tokens)
+
+@app.route('/api/auth/logout', methods=['POST'])
+@require_auth
+def logout():
+    """登出所有设备：自增 token_version，使该用户已签发的所有 JWT 立即失效。"""
+    user_id = request.current_user['id']
+    conn = get_db()
+    conn.execute('UPDATE users SET token_version = token_version + 1 WHERE id = ?', (user_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({'success': True, 'message': '已登出所有设备，请重新登录'})
 
 @app.route('/api/auth/me', methods=['GET'])
 @require_auth
@@ -693,12 +750,13 @@ def admin_reset_password(user_id):
         conn.close()
         return jsonify({'error': '用户不存在'}), 404
 
-    conn.execute('UPDATE users SET password_hash = ? WHERE id = ?', (hash_password(new_password), user_id))
+    conn.execute('UPDATE users SET password_hash = ?, token_version = token_version + 1 WHERE id = ?',
+                 (hash_password(new_password), user_id))
     conn.commit()
     conn.close()
 
     return jsonify({
-        'message': f'用户 {user["username"]} 的密码已重置'
+        'message': f'用户 {user["username"]} 的密码已重置，其已登录设备需重新登录'
     })
 
 # ============ 会话管理 API ============
@@ -808,10 +866,48 @@ _HOP_BY_HOP = {
 def _proxy_headers(headers):
     return [(k, v) for k, v in headers.items() if k.lower() not in _HOP_BY_HOP]
 
+def _request_session_ids():
+    """尽力从 body/query 提取可能的会话标识，用于 opt-in 归属校验。"""
+    ids = set()
+    try:
+        body = request.get_json(silent=True)
+        if isinstance(body, dict):
+            for k in ('hermes_session_id', 'session_id', 'session', 'sessionId'):
+                v = body.get(k)
+                if isinstance(v, str) and v:
+                    ids.add(v)
+    except Exception:
+        pass
+    for k in ('hermes_session_id', 'session_id', 'session'):
+        v = request.args.get(k)
+        if v:
+            ids.add(v)
+    return ids
+
+def _owns_all_sessions(user_id):
+    """opt-in 归属校验：请求中可识别的会话若属于他人则返回 False；无法识别的标识放行（不破坏功能）。"""
+    ids = _request_session_ids()
+    if not ids:
+        return True
+    conn = get_db()
+    try:
+        for sid in ids:
+            row = conn.execute(
+                'SELECT user_id FROM sessions WHERE id = ? OR hermes_session_id = ?',
+                (sid, sid)).fetchone()
+            if row and row['user_id'] != user_id:
+                return False
+    finally:
+        conn.close()
+    return True
+
 @app.route('/v1/<path:path>', methods=['GET', 'POST', 'PUT', 'PATCH', 'DELETE'])
 @require_auth
 def proxy_hermes(path):
     """代理 Hermes API 请求"""
+    # opt-in 会话归属校验（默认关闭；开启后阻断可识别的跨用户会话访问）
+    if Config.ENFORCE_SESSION_OWNERSHIP and not _owns_all_sessions(request.current_user['id']):
+        return jsonify({'error': '无权访问该会话'}), 403
     # 构建目标 URL
     url = f"{Config.HERMES_URL}/v1/{path}"
 
@@ -860,6 +956,14 @@ def proxy_hermes_api(path):
         current_user = request.current_user
         if current_user['role'] != 'admin':
             return jsonify({'error': '只有管理员可以管理助手'}), 403
+
+    # opt-in 白名单（默认空=不启用）：仅放行配置的前缀，其余拒绝
+    if Config.API_ALLOW_PREFIXES and not any(path.startswith(p) for p in Config.API_ALLOW_PREFIXES):
+        return jsonify({'error': '该接口未在白名单内'}), 403
+
+    # opt-in 会话归属校验（默认关闭）
+    if Config.ENFORCE_SESSION_OWNERSHIP and not _owns_all_sessions(request.current_user['id']):
+        return jsonify({'error': '无权访问该会话'}), 403
 
     url = f"{Config.HERMES_URL}/api/{path}"
     if request.query_string:

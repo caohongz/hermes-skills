@@ -1,7 +1,7 @@
 ---
 name: bluebird-gateway
 description: 部署与管理「青鸟」App 的接入网关（JWT 认证代理 + 多用户管理 + 助手管理）。当这台主机的拥有者要安装/检查/重启/停止青鸟网关、侦测网络、或获取管理员(owner)认领令牌时使用。
-version: 1.6.0
+version: 1.7.0
 metadata:
   author: caohongz
   homepage: https://github.com/caohongz/hermes-skills
@@ -107,6 +107,13 @@ python3 ~/.hermes/skills/bluebird-gateway/scripts/setup.py tailscale [authkey]
 - 网关在 `8443` 起独立 Flask 进程，与 Hermes 的 `8642` 并行。
 - 传输无关：远程访问由 owner 自理（域名+端口映射+HTTPS，或 `tailscale`）。网关 `config.json` 的 `bind_host` 默认 `0.0.0.0`（直连/裸IP）；置于 Caddy 反代或 `tailscale serve` 之后时设为 `127.0.0.1`，只在本机监听、由前置层负责对外与 TLS。
 - TLS 两种做法：①前置反代（Caddy/nginx）做 HTTPS、网关跑纯 HTTP（默认）；②网关自带 TLS——在 `config.json` 填 `ssl_certfile` / `ssl_keyfile`（PEM 路径），网关直接服务 HTTPS、无需反代。证书文件需对运行网关的用户可读；证书续期后需重启网关（`setup.py restart`）重新加载。
+
+- **令牌吊销**：改密 / 管理员重置密码 / `POST /api/auth/logout` 会自增该用户 `token_version`，
+  使其已签发的所有 JWT 立即失效（该用户已登录设备需重新登录）。删号同样使其令牌失效。
+- **多用户授权加固（可选，默认关闭）**：`config.json` 两个开关，改完 `setup.py restart` 生效——
+  - `enforce_session_ownership: true`：`/v1`、`/api` 转发前校验请求里出现的会话标识归属，阻断可识别的跨用户会话访问（无法识别的标识仍放行，不破坏功能）；
+  - `api_allow_prefixes: ["chat/", "models"]`：把 `/api/*` 代理改为白名单，仅放行列出的前缀，其余 403。
+  - ⚠️ **开启前务必确认 app 实际用到的 `/v1`/`/api` 路径与会话标识字段（`hermes_session_id`/`session_id` 等），避免误挡正常请求。** 建议先在测试账号上验证再推广。
 
 ## Verification
 

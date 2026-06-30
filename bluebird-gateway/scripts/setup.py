@@ -34,7 +34,7 @@ try:
 except Exception:
     pass
 
-SKILL_VERSION = 2
+SKILL_VERSION = 3
 # 网关版本不在此重复硬编码：单一事实源是 gateway.py 的 GATEWAY_VERSION，
 # 由 bundled_version()/installed_version() 解析，避免与 gateway.py 漂移。
 
