@@ -43,8 +43,9 @@ except ImportError:
 # pbkdf2 回退算法的迭代次数
 PBKDF2_ITERATIONS = 200_000
 
-# 网关版本（与 skill 版本联动，便于 app 校验"装的是哪一版"）
-GATEWAY_VERSION = "2.0.0"
+# 网关版本（单一事实源：app/status 经 /health 拿到的就是它；升级检测靠它比对）
+# 规则：凡改动 gateway.py 行为/结构就 +1；setup.py 不再重复硬编码，改为解析本常量。
+GATEWAY_VERSION = "2.1.0"
 
 # ============ 配置 ============
 
@@ -74,6 +75,11 @@ class Config:
     def load(cls):
         """加载配置"""
         cls.DATA_DIR.mkdir(parents=True, exist_ok=True)
+        # 数据目录含密码哈希(gateway.db)与密钥(config.json)，收紧为仅 owner 可访问
+        try:
+            os.chmod(cls.DATA_DIR, 0o700)
+        except Exception:
+            pass
 
         # 加载或生成配置文件
         if cls.CONFIG_PATH.exists():
@@ -123,6 +129,47 @@ class Config:
         os.chmod(cls.CONFIG_PATH, 0o600)  # 仅所有者可读写
 
 # ============ 数据库 ============
+
+# 数据库结构版本：每次给「已存在的表」加列/改结构时 +1，并在 MIGRATIONS 登记对应迁移。
+# 约定：init_db 的 CREATE TABLE 永远反映「最新结构」；迁移只负责把历史库逐级升到最新。
+# 因此全新库（CREATE TABLE 已是最新）跑迁移应是幂等 no-op，迁移函数务必自带存在性检查。
+SCHEMA_VERSION = 1
+
+def _column_exists(conn, table, column):
+    """表里是否已有该列（供迁移做幂等判断）。"""
+    return any(row[1] == column for row in conn.execute(f"PRAGMA table_info({table})").fetchall())
+
+def _schema_version(conn):
+    try:
+        row = conn.execute("SELECT value FROM settings WHERE key='schema_version'").fetchone()
+        return int(row[0]) if row and row[0] is not None else 0
+    except Exception:
+        return 0
+
+def _set_schema_version(conn, v):
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES ('schema_version', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (str(v),))
+
+# 迁移登记表：{目标版本: 接收 conn 的函数}。函数必须幂等（自带列/表存在性检查），
+# 这样在全新库上重复执行也安全。示例（将在后续版本启用 token_version 吊销时填入）：
+#   def _mig_add_token_version(conn):
+#       if not _column_exists(conn, "users", "token_version"):
+#           conn.execute("ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0")
+#   MIGRATIONS = {2: _mig_add_token_version}
+MIGRATIONS = {}
+
+def run_migrations(conn):
+    """把数据库结构从当前版本逐级升到 SCHEMA_VERSION；全新库与历史库都安全。"""
+    cur = _schema_version(conn)
+    for v in sorted(MIGRATIONS):
+        if v > cur:
+            MIGRATIONS[v](conn)
+            _set_schema_version(conn, v)
+            cur = v
+    # 无迁移可跑（全新库或已最新）时盖章到基线版本，便于后续判断/排查
+    if cur < SCHEMA_VERSION:
+        _set_schema_version(conn, SCHEMA_VERSION)
 
 def init_db():
     """初始化数据库"""
@@ -194,8 +241,17 @@ def init_db():
     conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_devices_user_id ON devices(user_id)")
 
+    # 应用结构迁移（settings 表此时已建好）；全新库为幂等 no-op，历史库逐级升级
+    run_migrations(conn)
+
     conn.commit()
     conn.close()
+
+    # gateway.db 含密码哈希与 owner_claim_token：收紧为仅 owner 可读写（与 config.json 0600 对齐）
+    try:
+        os.chmod(Config.DB_PATH, 0o600)
+    except Exception:
+        pass
 
 def get_db():
     """获取数据库连接"""
@@ -282,12 +338,18 @@ def generate_token(user_id: int) -> dict:
         'expires_at': int((now + timedelta(days=Config.JWT_EXPIRE_DAYS)).timestamp())
     }
 
-def verify_token(token: str) -> int:
-    """验证 JWT Token 并返回 user_id"""
+def verify_token(token: str, expected_type: str = None):
+    """验证 JWT Token 并返回 user_id。
+
+    expected_type 非空时，额外要求 payload['type'] 匹配（如 'refresh'），不匹配返回 None。
+    默认 None 保持旧行为（不校验 type），兼容现有调用方与已签发令牌。
+    """
     try:
         payload = jwt.decode(token, Config.JWT_SECRET, algorithms=['HS256'])
+        if expected_type is not None and payload.get('type') != expected_type:
+            return None
         return payload['user_id']
-    except:
+    except Exception:
         return None
 
 def get_current_user():
@@ -456,11 +518,11 @@ def login():
 
 @app.route('/api/auth/refresh', methods=['POST'])
 def refresh():
-    """刷新 Token"""
+    """刷新 Token（仅接受 refresh 类型令牌；access 令牌不能用于续期）"""
     data = request.json
     refresh_token = data.get('refresh_token', '')
 
-    user_id = verify_token(refresh_token)
+    user_id = verify_token(refresh_token, expected_type='refresh')
     if not user_id:
         return jsonify({'error': '无效的刷新令牌'}), 401
 

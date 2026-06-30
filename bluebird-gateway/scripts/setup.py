@@ -24,7 +24,7 @@ HTTP，不再经过 LLM。
                tls status                         查看当前 http/https / 证书指纹
              证书一般由 agent 用 acme.sh 经 HTTP-01 / DNS-01 签发后传入。
 """
-import json, os, shutil, signal, socket, subprocess, sys, time
+import json, os, re, shutil, signal, socket, subprocess, sys, time
 import urllib.request, urllib.error
 from pathlib import Path
 
@@ -34,8 +34,9 @@ try:
 except Exception:
     pass
 
-SKILL_VERSION = 1
-GATEWAY_VERSION = "2.0.0"
+SKILL_VERSION = 2
+# 网关版本不在此重复硬编码：单一事实源是 gateway.py 的 GATEWAY_VERSION，
+# 由 bundled_version()/installed_version() 解析，避免与 gateway.py 漂移。
 
 # 本 skill 自带的明文源码（与本文件同目录），install 时复制到运行位置
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -52,6 +53,47 @@ CERT_DIR = GW_DIR / "certs"
 PROVISION_PATH = Path.home() / ".hermes" / "skills" / "manage-assistant" / "provision.py"
 DEFAULT_PORT = 8443
 HERMES_PORT = 8642
+
+
+# ---- 版本解析与比较（升级检测用）----
+# 单一事实源是 gateway.py 的 GATEWAY_VERSION 常量。bundled=skill 自带（将装的），
+# installed=已部署副本，running=/health 上报的。三者用同一解析逻辑，避免版本号漂移。
+
+def _parse_gateway_version(path):
+    """从一份 gateway.py 源码里解析 GATEWAY_VERSION 字符串；解析不到返回 None。"""
+    try:
+        m = re.search(r'GATEWAY_VERSION\s*=\s*["\']([^"\']+)["\']', Path(path).read_text("utf-8"))
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+
+def bundled_version():
+    """本 skill 自带（install 将要铺下去）的网关版本。"""
+    return _parse_gateway_version(GATEWAY_SRC)
+
+
+def installed_version():
+    """已部署副本(~/.hermes-gateway/hermes_gateway.py)的网关版本。"""
+    return _parse_gateway_version(GW_SCRIPT) if GW_SCRIPT.exists() else None
+
+
+def _ver_tuple(v):
+    try:
+        return tuple(int(x) for x in str(v).split("."))
+    except Exception:
+        return ()
+
+
+def version_lt(a, b):
+    """语义版本比较 a < b（缺位补 0）；任一不可解析时返回 False。"""
+    ta, tb = _ver_tuple(a), _ver_tuple(b)
+    if not ta or not tb:
+        return False
+    n = max(len(ta), len(tb))
+    ta += (0,) * (n - len(ta))
+    tb += (0,) * (n - len(tb))
+    return ta < tb
 
 
 def emit(o):
@@ -249,9 +291,13 @@ def act_status():
     h = health(port)
     installed = GW_SCRIPT.exists()
     running = bool(h) or pid_alive(read_pid())
+    cur = (h or {}).get("version") or installed_version()
+    bundled = bundled_version()
     emit({"ok": True, "installed": installed, "running": running,
           "skill_version": SKILL_VERSION,
-          "version": (h or {}).get("version") if h else (GATEWAY_VERSION if installed else None),
+          "version": cur,
+          "bundled_version": bundled,
+          "update_available": bool(installed and cur and bundled and version_lt(cur, bundled)),
           "port": port,
           "owner_claimed": (h or {}).get("owner_claimed"),
           "hermes_connected": (h or {}).get("hermes_connected")})
@@ -365,8 +411,13 @@ def act_stop():
 def act_info():
     port = gateway_port()
     h = health(port) or {}
+    cur = h.get("version") or installed_version()
+    bundled = bundled_version()
     emit({"ok": True, "installed": GW_SCRIPT.exists(), "running": bool(h),
-          "skill_version": SKILL_VERSION, "version": h.get("version"),
+          "skill_version": SKILL_VERSION,
+          "version": cur,
+          "bundled_version": bundled,
+          "update_available": bool(GW_SCRIPT.exists() and cur and bundled and version_lt(cur, bundled)),
           "port": port, "local_ip": local_ip(),
           "owner_claimed": h.get("owner_claimed"),
           "open_registration": h.get("open_registration"),

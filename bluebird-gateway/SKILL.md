@@ -1,7 +1,7 @@
 ---
 name: bluebird-gateway
 description: 部署与管理「青鸟」App 的接入网关（JWT 认证代理 + 多用户管理 + 助手管理）。当这台主机的拥有者要安装/检查/重启/停止青鸟网关、侦测网络、或获取管理员(owner)认领令牌时使用。
-version: 1.5.0
+version: 1.6.0
 metadata:
   author: caohongz
   homepage: https://github.com/caohongz/hermes-skills
@@ -80,6 +80,16 @@ python3 ~/.hermes/skills/bluebird-gateway/scripts/setup.py tailscale [authkey]
 > 对外端口由你的端口映射 / 反代决定，必须和 App 里填的一致。
 
 其它动作：`status` / `info` 连接信息 / `restart` / `stop` / `tls status` 看当前协议 / `tls off` 关 TLS。
+
+### 5. 升级已装的网关
+`status` / `info` 返回三个版本字段：`version`（当前在跑的）/ `bundled_version`（本 skill 自带的）/ `update_available`。
+当 `update_available:true`（或你刚更新了 skill）时，**重跑 `install` 即完成升级**——它幂等覆盖网关源码并重启，并**保留**：
+- `config.json`（端口 / `jwt_secret` / TLS 证书路径）→ **已登录用户不会掉线**；
+- `gateway.db`（账号 / 会话 / 密码 / owner 认领状态）。
+
+网关启动时自动跑数据库迁移（`run_migrations`，按 `schema_version` 逐级升），**老库平滑加列、无需手工改表**。
+> ⚠️ 升级有几秒停机；若新版 `/health` 30s 内没过，`install` 会失败而旧进程已停——查 `~/.hermes-gateway/gateway.log` 后重试（`install` 可反复跑）。
+> 升级只覆盖本机已有的 skill 源码：要先把 skill 更新到新版（`hermes skills install caohongz/hermes-skills/bluebird-gateway`）再 `install`。
 
 ## Troubleshooting（排错参考）
 
