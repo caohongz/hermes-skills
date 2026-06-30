@@ -1,7 +1,7 @@
 ---
 name: bluebird-gateway
 description: 部署与管理「青鸟」App 的接入网关（JWT 认证代理 + 多用户管理 + 助手管理）。当这台主机的拥有者要安装/检查/重启/停止青鸟网关、侦测网络、或获取管理员(owner)认领令牌时使用。
-version: 1.4.0
+version: 1.5.0
 metadata:
   author: caohongz
   homepage: https://github.com/caohongz/hermes-skills
@@ -19,15 +19,55 @@ metadata:
 
 ## Procedure
 
-主路径，一条命令：
+目标：装好网关，**尽量配好可信 HTTPS 远程访问**，最后把 App 该填的【网关地址】+【owner_claim_token】交给用户。按下面的档位**逐级降级**，能成一档就停在那档；过程中**可以询问用户、也可以自行探测**。setup.py 每个动作都打印 `[[HAM:BEGIN]]{json}[[HAM:END]]`，解析它判断成败。
 
+### 1. 装网关（确定性）
 ```
 python3 ~/.hermes/skills/bluebird-gateway/scripts/setup.py install
 ```
+输出含 `owner_claim_token` / `port` / `local_ip`。此时网关在本机跑 **HTTP**（尚不能安全公网用）。
 
-成功会打印 `[[HAM:BEGIN]]{"ok":true,...,"owner_claim_token":"..."}[[HAM:END]]`。**把这段原样回传给用户**，并告诉他：在青鸟 App 注册时填 `owner_claim_token` 即成为管理员。
+### 2. 探测环境
+```
+python3 ~/.hermes/skills/bluebird-gateway/scripts/setup.py detect
+```
+看 `public_ip` / `has_nat` / `tools`(openssl/acme.sh/certbot/caddy/tailscale 在不在) / `port80_free` / `port443_free`，据此选下面的档。
 
-其它动作（末尾换词即可）：`status` 状态 / `detect` 网络侦测 / `restart` 重启 / `stop` 停止 / `info` 连接信息 / `tailscale` 用 Tailscale 暴露网关（可选传输方案）。
+### 3. 配远程访问 + TLS（逐级降级，成了就停）
+
+**A 档 · 可信 HTTPS（首选）**——需要一个域名。**问用户**：
+> 你有域名指向这台机器吗？能给 DNS 服务商的 API 凭据吗（走 DNS-01，无需开放端口、CGNAT 也行）？
+
+- 有域名 + **入站 80 可达** → acme.sh HTTP-01：
+  `curl https://get.acme.sh | sh -s email=<你的邮箱>` →
+  `~/.acme.sh/acme.sh --issue --standalone -d <域名>`
+- 有域名 + **DNS API 凭据**（推荐，封端口/CGNAT 都行）→ acme.sh DNS-01：
+  `export <该 DNS 服务商的环境变量>` → `~/.acme.sh/acme.sh --issue --dns <dns_provider> -d <域名>`
+- 签到后装证书 + 挂上网关（`--reloadcmd` 让续期自动重启网关）：
+  ```
+  ~/.acme.sh/acme.sh --install-cert -d <域名> \
+    --fullchain-file ~/.hermes-gateway/certs/fullchain.pem \
+    --key-file ~/.hermes-gateway/certs/privkey.pem \
+    --reloadcmd "python3 ~/.hermes/skills/bluebird-gateway/scripts/setup.py restart"
+  python3 ~/.hermes/skills/bluebird-gateway/scripts/setup.py tls use-cert \
+    ~/.hermes-gateway/certs/fullchain.pem ~/.hermes-gateway/certs/privkey.pem
+  ```
+  返回 `tls:https` 即成。App 网关地址 = `https://<域名>:<port>`。
+
+**B 档 · 降级 Tailscale**——没域名 / 签不到证书：
+```
+python3 ~/.hermes/skills/bluebird-gateway/scripts/setup.py tailscale [authkey]
+```
+网关挂上 tailnet（隧道自带加密，HTTP 即可）。App 用打印出的 MagicDNS / 裸 IP 地址。**提醒用户**：每台手机要装官方 Tailscale app，且与其它 VPN 互斥。
+
+**C 档 · 给建议，别硬来**——上面都不行：把现状讲清，列出他需要补的（一个域名 / 一个 DNS API token / 或装 Tailscale），并强调：**在补齐前只可局域网或隧道内用 HTTP，切勿明文公网暴露**（密码、JWT、对话都会被嗅探）。
+
+### 4. 交付给用户
+不管停在哪档，最后明确两件事：
+- **网关地址**填什么：`https://<域名>:<port>`（A 档）/ tailnet 地址（B 档）/ 仅局域网测试才用 `http://<ip>:<port>`。
+- **owner_claim_token = `<...>`**：首次在 App 注册时填它即成管理员，认领后开放注册自动关闭。
+
+其它动作：`status` / `info` 连接信息 / `restart` / `stop` / `tls status` 看当前协议 / `tls off` 关 TLS。
 
 ## Troubleshooting（排错参考）
 

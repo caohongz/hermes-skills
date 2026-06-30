@@ -18,6 +18,11 @@ HTTP，不再经过 LLM。
   tailscale  （可选）用 `tailscale serve` 把本机网关挂上 tailnet（带自动 HTTPS），
              并打印 App 该填的 MagicDNS 地址 / 裸 IP 地址。需先装好 Tailscale。
              用法：setup.py tailscale [authkey]
+  tls        配置网关 TLS（建筑块，决策由 agent 按 SKILL.md 编排）：
+               tls use-cert <证书PEM> <私钥PEM>  挂上已签发的证书 → 网关直接 HTTPS
+               tls off                            关闭 TLS → 回到 HTTP
+               tls status                         查看当前 http/https / 证书指纹
+             证书一般由 agent 用 acme.sh 经 HTTP-01 / DNS-01 签发后传入。
 """
 import json, os, shutil, signal, socket, subprocess, sys, time
 import urllib.request, urllib.error
@@ -43,6 +48,7 @@ CONFIG_PATH = GW_DIR / "config.json"
 DB_PATH = GW_DIR / "gateway.db"
 PID_PATH = GW_DIR / "gateway.pid"
 LOG_PATH = GW_DIR / "gateway.log"
+CERT_DIR = GW_DIR / "certs"
 PROVISION_PATH = Path.home() / ".hermes" / "skills" / "manage-assistant" / "provision.py"
 DEFAULT_PORT = 8443
 HERMES_PORT = 8642
@@ -251,16 +257,36 @@ def act_status():
           "hermes_connected": (h or {}).get("hermes_connected")})
 
 
+def _have(cmd):
+    return bool(shutil.which(cmd))
+
+
+def _port_free(port):
+    """本机该端口当前是否空闲（HTTP-01 临时绑 80 时要用）。仅本机判断，不代表公网可达。"""
+    try:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("0.0.0.0", port))
+        srv.close()
+        return True
+    except Exception:
+        return False
+
+
 def act_detect():
     lip = local_ip()
     pip = public_ip()
     has_nat = True
     if lip and pip:
         has_nat = not pip.startswith(lip.split(".")[0])
+    # 供 agent 决策 TLS 路径：有哪些签发/隧道工具、80/443 能否本机绑（HTTP-01 用）。
+    tools = {t: _have(t) for t in ("openssl", "acme.sh", "certbot", "caddy", "tailscale")}
     emit({"ok": True, "local_ip": lip, "public_ip": pip, "has_nat": has_nat,
           "hermes_running": port_listening(HERMES_PORT),
           "gateway_running": bool(health(gateway_port())),
-          "gateway_port": gateway_port()})
+          "gateway_port": gateway_port(),
+          "tools": tools,
+          "port80_free": _port_free(80), "port443_free": _port_free(443)})
 
 
 def act_install():
@@ -417,6 +443,79 @@ def act_tailscale():
     emit(out)
 
 
+# ---- TLS（建筑块；"问用户/发掘/降级"的决策树在 SKILL.md，由 agent 编排）----
+
+def _cfg_set_tls(certfile, keyfile):
+    """写 config.json 的 ssl_certfile/ssl_keyfile（None=关闭），其余字段保留。"""
+    cfg = load_config()
+    cfg["ssl_certfile"] = certfile
+    cfg["ssl_keyfile"] = keyfile
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+
+
+def _cert_fingerprint(certfile):
+    """证书 SHA256 指纹（供 App 固定/用户核对）；拿不到返回 None。"""
+    if not certfile:
+        return None
+    try:
+        r = subprocess.run(["openssl", "x509", "-noout", "-fingerprint", "-sha256",
+                            "-in", str(certfile)], capture_output=True, text=True, timeout=10)
+        if r.returncode == 0 and "=" in r.stdout:
+            return r.stdout.strip().split("=", 1)[1]
+    except Exception:
+        pass
+    return None
+
+
+def _restart_verify(port):
+    """重启网关并等 /health（http/https 都试）。返回 health dict 或 None。"""
+    _start_gateway(port)
+    return _wait_health(port, 30)
+
+
+def act_tls():
+    sub = sys.argv[2] if len(sys.argv) > 2 else "status"
+    port = gateway_port()
+    cfg = load_config()
+
+    if sub == "status":
+        on = bool(cfg.get("ssl_certfile") and cfg.get("ssl_keyfile"))
+        emit({"ok": True, "tls": "https" if on else "http", "port": port,
+              "ssl_certfile": cfg.get("ssl_certfile"), "ssl_keyfile": cfg.get("ssl_keyfile"),
+              "fingerprint": _cert_fingerprint(cfg.get("ssl_certfile")) if on else None})
+
+    if sub == "off":
+        _cfg_set_tls(None, None)
+        if GW_SCRIPT.exists() and not _restart_verify(port):
+            fail("关闭 TLS 后 /health 未通过，见 " + str(LOG_PATH))
+        emit({"ok": True, "tls": "http", "port": port, "local_ip": local_ip()})
+
+    if sub == "use-cert":
+        certfile = sys.argv[3] if len(sys.argv) > 3 else ""
+        keyfile = sys.argv[4] if len(sys.argv) > 4 else ""
+        if not certfile or not keyfile:
+            fail("用法：setup.py tls use-cert <证书PEM> <私钥PEM>")
+        cp = Path(certfile).expanduser()
+        kp = Path(keyfile).expanduser()
+        if not cp.exists() or not kp.exists():
+            fail("证书或私钥文件不存在：" + str(cp) + " | " + str(kp))
+        try:  # 网关以本用户身份跑，证书必须对它可读
+            cp.read_bytes()
+            kp.read_bytes()
+        except Exception as e:
+            fail("证书/私钥不可读（注意运行网关的用户权限）：" + str(e))
+        _cfg_set_tls(str(cp), str(kp))
+        h = _restart_verify(port)
+        if not h:
+            fail("启用 HTTPS 后 /health 未通过（证书与私钥不匹配？文件不可读？），见 " + str(LOG_PATH))
+        emit({"ok": True, "tls": "https", "port": port, "local_ip": local_ip(),
+              "fingerprint": _cert_fingerprint(str(cp)),
+              "note": ("已启用 HTTPS；App 网关地址用 https://<你的域名>:%d。"
+                       "证书续期后需重跑 setup.py restart（acme.sh 可用 --reloadcmd 自动触发）。") % port})
+
+    fail("未知 tls 子动作：" + sub + "（可用：use-cert / off / status）")
+
+
 def main():
     a = sys.argv[1] if len(sys.argv) > 1 else "status"
     try:
@@ -434,6 +533,8 @@ def main():
             act_info()
         elif a == "tailscale":
             act_tailscale()
+        elif a == "tls":
+            act_tls()
         else:
             fail("未知动作 " + a)
     except SystemExit:

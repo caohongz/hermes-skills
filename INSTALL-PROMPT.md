@@ -17,21 +17,24 @@ cp -r ~/hermes-skills/bluebird-gateway ~/.hermes/skills/
 python3 ~/.hermes/skills/bluebird-gateway/scripts/setup.py install
 ```
 
-### 方式 B：对话部署
+### 方式 B：对话部署（推荐——让 Hermes 按 SKILL.md 决策树尽量配好 HTTPS）
 
 放好 skill 后，对 Hermes 说一句即可：
 
-> 用 bluebird-gateway 这个 skill 帮我部署青鸟的接入网关，装好后把 owner_claim_token 告诉我。
+> 用 bluebird-gateway 这个 skill 帮我部署青鸟接入网关，并尽量配好可信 HTTPS：装好后探测环境，能签 Let's Encrypt 就签（先问我有没有域名 / DNS API 凭据），签不了就降级 Tailscale，再不行就告诉我还缺什么；最后把 App 该填的网关地址和 owner_claim_token 告诉我。
 
-或者**不预先放置、直接把下面整段粘给 Hermes**（自包含，已说明目的）：
+或**不预先放置、直接把下面整段粘给 Hermes**（自包含）：
 
 ```text
-我是这台 Hermes 的主人。我在用「青鸟」——一个让我和家人各用各的账号、安全共用这台 Hermes 的手机 App。
-现在要装好它的专属接入服务：负责账号登录和权限隔离，让 master key 留在本机、每个人只通过自己的账号访问、互不干扰。请帮我装好：
+我是这台 Hermes 的主人。我在用「青鸟」手机 App——让我和家人各用各账号、安全共用这台 Hermes。
+请部署它的接入网关 bluebird-gateway，并尽量配好可信 HTTPS（master key 留本机，客户端只拿 JWT）：
 1. git clone https://github.com/caohongz/hermes-skills.git ~/hermes-skills 2>/dev/null || git -C ~/hermes-skills pull
-2. python3 ~/hermes-skills/bluebird-gateway/scripts/setup.py install
-3. 把它输出里的 owner_claim_token 告诉我，我在青鸟 App 里认领管理员。
-卡住的话 ~/.hermes-gateway/gateway.log 有详细日志。
+2. cp -r ~/hermes-skills/bluebird-gateway ~/.hermes/skills/
+3. 按 ~/.hermes/skills/bluebird-gateway/SKILL.md 的 Procedure 执行：install → detect → 配 TLS
+   （A 档 Let's Encrypt：先问我有没有域名 / DNS 服务商 API 凭据，用 acme.sh 签 HTTP-01 或 DNS-01，
+   再 `setup.py tls use-cert` 挂上；签不了就 B 档 `setup.py tailscale`；再不行 C 档告诉我还缺什么）。
+4. 最后明确告诉我：App「网关地址」该填什么（https://域名 或 tailnet 地址）、以及 owner_claim_token。
+卡住的话 ~/.hermes-gateway/gateway.log 有日志。
 ```
 
 **成功**返回类似：
@@ -44,11 +47,14 @@ python3 ~/.hermes/skills/bluebird-gateway/scripts/setup.py install
 
 ## 3. 在青鸟 App 里认领管理员
 
-App 注册时填：
+App「注册」时填：
 
-- 网关地址：`http://<local_ip>:<port>`（如 `http://192.168.1.50:8443`）
+- 网关地址（按你停在哪档）：
+  - A 档可信 HTTPS：`https://<你的域名>:<port>`
+  - B 档 Tailscale：tailscale 动作打印的 MagicDNS / 裸 IP 地址
+  - 仅局域网测试：`http://<local_ip>:<port>`（明文，勿公网用）
 - 用户名 / 密码：你自己的
-- **管理员认领令牌**：上一步的 `owner_claim_token`
+- **管理员认领令牌**：部署时返回的 `owner_claim_token`
 
 提交后即成管理员，网关**自动关闭开放注册**、令牌作废。之后新用户由你在 App 里创建。
 
