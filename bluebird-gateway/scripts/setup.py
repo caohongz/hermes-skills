@@ -8,15 +8,18 @@ HTTP，不再经过 LLM。
 每个动作打印 [[HAM:BEGIN]]{json}[[HAM:END]]，供 app / 你解析。
 
 动作：
-  status   探测网关是否安装 / 在跑 / 版本 / 端口
-  detect   侦测网络环境（本地IP / 公网IP / NAT / hermes 是否在跑）
-  install  复制网关+provisioner、装依赖、注入 master key、生成 JWT 密钥与
-           owner 一次性认领令牌、起常驻进程、/health 自检；返回连接信息
-  restart  重启网关进程
-  stop     停止网关进程
-  info     返回连接信息（地址/端口/版本/是否已认领 owner）
+  status     探测网关是否安装 / 在跑 / 版本 / 端口
+  detect     侦测网络环境（本地IP / 公网IP / NAT / hermes 是否在跑）
+  install    复制网关+provisioner、装依赖、注入 master key、生成 JWT 密钥与
+             owner 一次性认领令牌、起常驻进程、/health 自检；返回连接信息
+  restart    重启网关进程
+  stop       停止网关进程
+  info       返回连接信息（地址/端口/版本/是否已认领 owner）
+  tailscale  （可选）用 `tailscale serve` 把本机网关挂上 tailnet（带自动 HTTPS），
+             并打印 App 该填的 MagicDNS 地址 / 裸 IP 地址。需先装好 Tailscale。
+             用法：setup.py tailscale [authkey]
 """
-import json, os, signal, socket, subprocess, sys, time
+import json, os, shutil, signal, socket, subprocess, sys, time
 import urllib.request, urllib.error
 from pathlib import Path
 
@@ -83,13 +86,20 @@ def pid_alive(pid):
 
 
 def health(port, timeout=2):
-    """返回网关 /health 的 JSON（成功）或 None。"""
-    try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=timeout) as r:
-            if r.status == 200:
-                return json.loads(r.read().decode())
-    except Exception:
-        pass
+    """返回网关 /health 的 JSON（成功）或 None。
+    网关可能是纯 HTTP，也可能自带 TLS 跑 HTTPS——两种都试（HTTPS 自检不校验证书，
+    因为连的是 127.0.0.1 而证书多半签给域名）。"""
+    import ssl
+    for url, kw in (
+        (f"http://127.0.0.1:{port}/health", {}),
+        (f"https://127.0.0.1:{port}/health", {"context": ssl._create_unverified_context()}),
+    ):
+        try:
+            with urllib.request.urlopen(url, timeout=timeout, **kw) as r:
+                if r.status == 200:
+                    return json.loads(r.read().decode())
+        except Exception:
+            pass
     return None
 
 
@@ -337,6 +347,76 @@ def act_info():
           "hermes_connected": h.get("hermes_connected")})
 
 
+# ---- Tailscale（可选传输方案）----
+# 网关本身传输无关：它只在 127.0.0.1 监听，由 `tailscale serve` 把它挂上 tailnet。
+# 这个动作只做 Tailscale 侧编排 + 打印 App 该填的地址，不碰核心 install。
+
+def _ts_cli():
+    return shutil.which("tailscale") or shutil.which("tailscale.exe")
+
+
+def _ts_status(ts):
+    try:
+        r = subprocess.run([ts, "status", "--json"], capture_output=True, text=True, timeout=15)
+        if r.returncode == 0:
+            return json.loads(r.stdout)
+    except Exception:
+        pass
+    return None
+
+
+def act_tailscale():
+    ts = _ts_cli()
+    if not ts:
+        fail("未找到 tailscale 命令。请先安装 Tailscale（https://tailscale.com/download）"
+             "并确保它在 PATH 中，再重试。")
+    port = gateway_port()
+    authkey = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("TS_AUTHKEY", "").strip()
+
+    # 1) 确保已登录 tailnet
+    st = _ts_status(ts)
+    if (st or {}).get("BackendState") != "Running":
+        if authkey:
+            up = subprocess.run([ts, "up", "--authkey", authkey],
+                                capture_output=True, text=True, timeout=90)
+            if up.returncode != 0:
+                fail("tailscale up 失败：" + (up.stderr or up.stdout or "")[:300])
+            st = _ts_status(ts)
+        else:
+            fail("Tailscale 未登录。请先 `tailscale up`（浏览器登录），或带 auth key 重试："
+                 "setup.py tailscale <authkey>")
+
+    # 2) tailscale serve 暴露本机网关（带自动 HTTPS）。
+    #    serve 的 flag 因 Tailscale 版本而异；失败时给出手动命令而不是硬中止。
+    serve_cmd = [ts, "serve", "--bg", "--https=443", f"http://127.0.0.1:{port}"]
+    served = subprocess.run(serve_cmd, capture_output=True, text=True, timeout=30)
+    serve_ok = served.returncode == 0
+
+    # 3) 取 MagicDNS 名 + tailnet IPv4
+    self_node = (st or {}).get("Self", {}) if st else {}
+    dns_name = (self_node.get("DNSName") or "").rstrip(".")
+    ips = self_node.get("TailscaleIPs") or []
+    ip4 = next((x for x in ips if ":" not in x), None)
+
+    out = {
+        "ok": True,
+        "tailscale_logged_in": True,
+        "serve_configured": serve_ok,
+        "magicdns": dns_name or None,
+        # App「网关地址」该填的值：优先 MagicDNS(https)，否则裸 IP(http，隧道已加密)
+        "app_url_magicdns": (f"https://{dns_name}" if (serve_ok and dns_name) else None),
+        "app_url_ip": (f"http://{ip4}:{port}" if ip4 else None),
+        "gateway_port": port,
+        "note": ("MagicDNS(serve) 方案：把网关 config.json 的 bind_host 设为 127.0.0.1 后重启；"
+                 "裸 IP 方案：bind_host 保持 0.0.0.0。"),
+    }
+    if not serve_ok:
+        out["serve_hint"] = ("tailscale serve 未成功（可能 flag 因版本不同）。可手动执行："
+                             + " ".join(serve_cmd) + "  错误："
+                             + (served.stderr or served.stdout or "")[:200])
+    emit(out)
+
+
 def main():
     a = sys.argv[1] if len(sys.argv) > 1 else "status"
     try:
@@ -352,6 +432,8 @@ def main():
             act_stop()
         elif a == "info":
             act_info()
+        elif a == "tailscale":
+            act_tailscale()
         else:
             fail("未知动作 " + a)
     except SystemExit:

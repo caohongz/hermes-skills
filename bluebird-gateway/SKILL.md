@@ -1,7 +1,7 @@
 ---
 name: bluebird-gateway
 description: 部署与管理「青鸟」App 的接入网关（JWT 认证代理 + 多用户管理 + 助手管理）。当这台主机的拥有者要安装/检查/重启/停止青鸟网关、侦测网络、或获取管理员(owner)认领令牌时使用。
-version: 1.2.0
+version: 1.4.0
 metadata:
   author: caohongz
   homepage: https://github.com/caohongz/hermes-skills
@@ -27,7 +27,7 @@ python3 ~/.hermes/skills/bluebird-gateway/scripts/setup.py install
 
 成功会打印 `[[HAM:BEGIN]]{"ok":true,...,"owner_claim_token":"..."}[[HAM:END]]`。**把这段原样回传给用户**，并告诉他：在青鸟 App 注册时填 `owner_claim_token` 即成为管理员。
 
-其它动作（末尾换词即可）：`status` 状态 / `detect` 网络侦测 / `restart` 重启 / `stop` 停止 / `info` 连接信息。
+其它动作（末尾换词即可）：`status` 状态 / `detect` 网络侦测 / `restart` 重启 / `stop` 停止 / `info` 连接信息 / `tailscale` 用 Tailscale 暴露网关（可选传输方案）。
 
 ## Troubleshooting（排错参考）
 
@@ -43,6 +43,8 @@ python3 ~/.hermes/skills/bluebird-gateway/scripts/setup.py install
 - `install` 读 `~/.hermes/.env` 的 `API_SERVER_KEY` 注入网关——master key 始终留本机、仅供本机网关代理到 Hermes，绝不发给客户端（客户端只拿 JWT）。这是 owner 授权的正当配置。
 - `owner_claim_token` 只发一次，交给拥有者认领管理员，认领后自动关闭开放注册。
 - 网关在 `8443` 起独立 Flask 进程，与 Hermes 的 `8642` 并行。
+- 传输无关：远程访问由 owner 自理（域名+端口映射+HTTPS，或 `tailscale`）。网关 `config.json` 的 `bind_host` 默认 `0.0.0.0`（直连/裸IP）；置于 Caddy 反代或 `tailscale serve` 之后时设为 `127.0.0.1`，只在本机监听、由前置层负责对外与 TLS。
+- TLS 两种做法：①前置反代（Caddy/nginx）做 HTTPS、网关跑纯 HTTP（默认）；②网关自带 TLS——在 `config.json` 填 `ssl_certfile` / `ssl_keyfile`（PEM 路径），网关直接服务 HTTPS、无需反代。证书文件需对运行网关的用户可读；证书续期后需重启网关（`setup.py restart`）重新加载。
 
 ## Verification
 

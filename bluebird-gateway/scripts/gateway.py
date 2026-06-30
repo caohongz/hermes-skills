@@ -57,10 +57,18 @@ class Config:
 
     # 默认配置
     GATEWAY_PORT = 8443
+    # 监听地址。默认 0.0.0.0（直连/裸IP/端口映射场景，含 Tailscale 裸 IP `http://100.x:port`）。
+    # 当网关躲在 Caddy 反代或 `tailscale serve` 之后时，设为 127.0.0.1，使其只在本机可达、
+    # 由前置层负责对外暴露与 TLS。
+    BIND_HOST = "0.0.0.0"
     HERMES_URL = "http://127.0.0.1:8642"  # Hermes 本地地址
     HERMES_API_KEY = None  # 从环境变量或配置文件读取
     JWT_SECRET = None  # 首次运行时生成
     JWT_EXPIRE_DAYS = 30
+    # TLS（可选）：填了 cert+key 路径且文件存在，则网关直接服务 HTTPS（自包含，无需前置反代）；
+    # 留空则纯 HTTP（由前面的 Caddy/nginx/tailscale serve 负责 TLS）。
+    SSL_CERTFILE = None
+    SSL_KEYFILE = None
 
     @classmethod
     def load(cls):
@@ -72,9 +80,12 @@ class Config:
             with open(cls.CONFIG_PATH, 'r') as f:
                 config = json.load(f)
                 cls.GATEWAY_PORT = config.get('gateway_port', cls.GATEWAY_PORT)
+                cls.BIND_HOST = config.get('bind_host', cls.BIND_HOST)
                 cls.HERMES_URL = config.get('hermes_url', cls.HERMES_URL)
                 cls.HERMES_API_KEY = config.get('hermes_api_key')
                 cls.JWT_SECRET = config.get('jwt_secret')
+                cls.SSL_CERTFILE = config.get('ssl_certfile') or None
+                cls.SSL_KEYFILE = config.get('ssl_keyfile') or None
 
         # 如果没有配置，尝试从环境变量读取
         if not cls.HERMES_API_KEY:
@@ -100,9 +111,12 @@ class Config:
         """保存配置"""
         config = {
             'gateway_port': cls.GATEWAY_PORT,
+            'bind_host': cls.BIND_HOST,
             'hermes_url': cls.HERMES_URL,
             'hermes_api_key': cls.HERMES_API_KEY,
             'jwt_secret': cls.JWT_SECRET,
+            'ssl_certfile': cls.SSL_CERTFILE,
+            'ssl_keyfile': cls.SSL_KEYFILE,
         }
         with open(cls.CONFIG_PATH, 'w') as f:
             json.dump(config, f, indent=2)
@@ -971,8 +985,15 @@ def main():
         print("  3. 在 ~/.hermes-gateway/config.json 中配置")
         return
 
+    # TLS：配置了 cert+key 且文件存在则直接服务 HTTPS，否则纯 HTTP（TLS 交前置反代）
+    ssl_ctx = None
+    if (Config.SSL_CERTFILE and Config.SSL_KEYFILE
+            and Path(Config.SSL_CERTFILE).exists() and Path(Config.SSL_KEYFILE).exists()):
+        ssl_ctx = (Config.SSL_CERTFILE, Config.SSL_KEYFILE)
+    scheme = "https" if ssl_ctx else "http"
+
     print(f"\n✅ 配置加载成功")
-    print(f"   网关地址: http://0.0.0.0:{Config.GATEWAY_PORT}")
+    print(f"   监听地址: {scheme}://{Config.BIND_HOST}:{Config.GATEWAY_PORT}")
     print(f"   Hermes: {Config.HERMES_URL}")
     print(f"   数据目录: {Config.DATA_DIR}")
     print(f"\n🔐 安全特性:")
@@ -987,11 +1008,12 @@ def main():
     print(f"   All  /v1/*              - Hermes API 代理")
     print("=" * 60)
 
-    # 启动 Flask
+    # 启动 Flask（ssl_ctx 为 None 时即纯 HTTP）
     app.run(
-        host='0.0.0.0',
+        host=Config.BIND_HOST,
         port=Config.GATEWAY_PORT,
-        debug=False
+        debug=False,
+        ssl_context=ssl_ctx
     )
 
 if __name__ == '__main__':
