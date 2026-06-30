@@ -1,7 +1,7 @@
 ---
 name: bluebird-gateway
 description: 部署与管理「青鸟」App 的接入网关（JWT 认证代理 + 多用户管理 + 助手管理）。当这台主机的拥有者要安装/检查/重启/停止青鸟网关、侦测网络、或获取管理员(owner)认领令牌时使用。
-version: 1.7.0
+version: 1.7.1
 metadata:
   author: caohongz
   homepage: https://github.com/caohongz/hermes-skills
@@ -96,7 +96,7 @@ python3 ~/.hermes/skills/bluebird-gateway/scripts/setup.py tailscale [authkey]
 `install` 失败时按现象处理，修好后重跑 `install`（幂等）：
 
 - **缺依赖 / 日志有 `ModuleNotFoundError`**：`python3 -m pip install --user flask flask-cors pyjwt requests`；国内超时则加镜像 `-i https://pypi.tuna.tsinghua.edu.cn/simple`；无 pip 先 `python3 -m ensurepip --user`（或 `sudo apt install -y python3-pip`）。
-- **报"/health 未通过"**：日志在 `~/.hermes-gateway/gateway.log`。若 `Address already in use`（8443 被占），改 `~/.hermes-gateway/config.json` 的 `gateway_port` 再重跑。
+- **报"/health 未通过"**：日志在 `~/.hermes-gateway/gateway.log`。`install`/`restart` 现在会先按 PID 文件+端口占用清掉旧网关进程（SIGTERM→SIGKILL）再启动；若仍报端口被占，多半是该端口被**非网关的其它服务**占用——按提示改 `~/.hermes-gateway/config.json` 的 `gateway_port`，或先停掉那个服务再重跑。
 - **报"未找到 API_SERVER_KEY"**：确认 `~/.hermes/.env` 有 `API_SERVER_KEY=...`（Hermes 正常安装后即有）。
 - 反复失败：把 `gateway.log` 末尾 + `python3 --version` 回传给 owner，说明卡在哪步。
 

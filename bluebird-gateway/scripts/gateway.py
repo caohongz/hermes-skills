@@ -45,7 +45,7 @@ PBKDF2_ITERATIONS = 200_000
 
 # 网关版本（单一事实源：app/status 经 /health 拿到的就是它；升级检测靠它比对）
 # 规则：凡改动 gateway.py 行为/结构就 +1；setup.py 不再重复硬编码，改为解析本常量。
-GATEWAY_VERSION = "2.2.0"
+GATEWAY_VERSION = "2.2.1"
 
 # ============ 配置 ============
 

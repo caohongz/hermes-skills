@@ -34,7 +34,7 @@ try:
 except Exception:
     pass
 
-SKILL_VERSION = 3
+SKILL_VERSION = 4
 # 网关版本不在此重复硬编码：单一事实源是 gateway.py 的 GATEWAY_VERSION，
 # 由 bundled_version()/installed_version() 解析，避免与 gateway.py 漂移。
 
@@ -228,19 +228,91 @@ def _ensure_deps():
             _pip_install(["bcrypt"], PYPI_MIRROR)
 
 
-def _stop_gateway():
-    pid = read_pid()
-    if pid_alive(pid):
+def _pids_on_port(port):
+    """尽力找出占用该端口(LISTEN)的进程 PID；按可用工具(ss/lsof/fuser)逐个尝试。
+    用于 PID 文件与实际进程不一致时的兜底定位。"""
+    pids = set()
+    try:
+        r = subprocess.run(["ss", "-ltnpH", "sport = :%d" % port],
+                           capture_output=True, text=True, timeout=5)
+        for m in re.finditer(r"pid=(\d+)", r.stdout or ""):
+            pids.add(int(m.group(1)))
+    except Exception:
+        pass
+    if not pids:
         try:
-            os.kill(pid, signal.SIGTERM)
-            time.sleep(1)
+            r = subprocess.run(["lsof", "-ti", "tcp:%d" % port, "-sTCP:LISTEN"],
+                               capture_output=True, text=True, timeout=5)
+            for tok in (r.stdout or "").split():
+                if tok.strip().isdigit():
+                    pids.add(int(tok.strip()))
         except Exception:
             pass
+    if not pids:
+        try:
+            r = subprocess.run(["fuser", "%d/tcp" % port],
+                               capture_output=True, text=True, timeout=5)
+            for tok in ((r.stdout or "") + " " + (r.stderr or "")).split():
+                if tok.strip().isdigit():
+                    pids.add(int(tok.strip()))
+        except Exception:
+            pass
+    return pids
+
+
+def _looks_like_gateway(pid):
+    """该 PID 是否本网关进程(cmdline 含 hermes_gateway.py)，避免误杀同端口的其它服务。
+    /proc 不可用(非 Linux)时返回 True：无法判定则不阻止清理。"""
+    try:
+        if not os.path.exists("/proc/%d" % pid):
+            return True
+        with open("/proc/%d/cmdline" % pid, "rb") as f:
+            cmd = f.read().replace(b"\x00", b" ").decode("utf-8", "ignore")
+        return GW_SCRIPT.name in cmd
+    except Exception:
+        return True
+
+
+def _kill(pid, sig):
+    try:
+        os.kill(pid, sig)
+        return True
+    except Exception:
+        return False
+
+
+def _stop_gateway(port=None):
+    """停掉网关并确认端口已释放。先按 PID 文件、再按端口占用兜底(二者不一致时)，
+    只杀确属本网关的进程；SIGTERM 不退则升级 SIGKILL。返回端口是否最终空闲。"""
+    if port is None:
+        port = gateway_port()
+    targets = {read_pid()} | _pids_on_port(port)
+    targets = {p for p in targets if p and pid_alive(p) and _looks_like_gateway(p)}
+    for p in targets:
+        _kill(p, signal.SIGTERM)
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        if _port_free(port) and not any(pid_alive(p) for p in targets):
+            return True
+        time.sleep(0.3)
+    # 仍占着：对存活的 + 重新扫到的占用者升级 SIGKILL
+    again = {p for p in (targets | _pids_on_port(port)) if p and pid_alive(p) and _looks_like_gateway(p)}
+    for p in again:
+        _kill(p, signal.SIGKILL)
+    deadline = time.time() + 3
+    while time.time() < deadline:
+        if _port_free(port):
+            return True
+        time.sleep(0.3)
+    return _port_free(port)
 
 
 def _start_gateway(port):
     GW_DIR.mkdir(parents=True, exist_ok=True)
-    _stop_gateway()
+    if not _stop_gateway(port):
+        fail("端口 %d 仍被占用，旧网关进程没能停掉(PID 文件可能与实际进程不一致，或被同端口的"
+             "其它服务占用)。请手动结束占用该端口的进程后重试，或改 ~/.hermes-gateway/config.json "
+             "的 gateway_port。" % port)
     log = open(LOG_PATH, "ab")
     # 用 sys.executable 跑网关，保证依赖环境与 _ensure_deps 装的一致；脱离会话常驻。
     p = subprocess.Popen([sys.executable, str(GW_SCRIPT)], env=dict(os.environ),
