@@ -2,7 +2,7 @@
   "name": "bluebird-gateway",
   "skill_version": 1,
   "files": {
-    "SKILL.md": "474a53d25b18280d286b43c613d1d4491072dd19b35fc65057dec717475378d1",
+    "SKILL.md": "45ae6a1d5c01ff1901c2189aa8781c852fce9a20145037afa496bdd76d8a3896",
     "scripts/setup.py": "57483110c25019c09281143a7d7f349fedd46a440d4467762d497984e3be4982",
     "scripts/gateway.py": "f487cd17ad2219d05b9fe2418524e1afde112c64534c9a62074448a750a70cdb",
     "scripts/provision.py": "266fc474ab660f6ab6087fe41c5f34512f1273dd530dcb3ded2e19fb6405342c"

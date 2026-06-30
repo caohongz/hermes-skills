@@ -33,7 +33,9 @@ python3 ~/.hermes/skills/bluebird-gateway/scripts/setup.py install
 3. 按 ~/.hermes/skills/bluebird-gateway/SKILL.md 的 Procedure 执行：install → detect → 配 TLS
    （A 档 Let's Encrypt：先问我有没有域名 / DNS 服务商 API 凭据，用 acme.sh 签 HTTP-01 或 DNS-01，
    再 `setup.py tls use-cert` 挂上；签不了就 B 档 `setup.py tailscale`；再不行 C 档告诉我还缺什么）。
-4. 最后明确告诉我：App「网关地址」该填什么（https://域名 或 tailnet 地址）、以及 owner_claim_token。
+4. 最后逐条明确告诉我：App「网关地址」该填什么（完整含协议和端口——注意端口未必是 8443，
+   取决于监听端口/端口映射，按实际可达的给）、owner_claim_token、以及「首次要在 App 选『注册』
+   而不是登录」。
 卡住的话 ~/.hermes-gateway/gateway.log 有日志。
 ```
 
