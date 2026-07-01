@@ -4,7 +4,7 @@
   "files": {
     "SKILL.md": "0a0cb70642d8d263798f649ec04fe3ba620e0aa5a7bb3c4dcc8e65af1dcc24fa",
     "scripts/setup.py": "fe1caf8553ec13509bc7600e5979e7a667fdb09663e3a52babe3a36749f75c27",
-    "scripts/gateway.py": "5c8b13730321f178efdcf47871db799aaac937f502cb52811e5f9a401b8072f4",
+    "scripts/gateway.py": "c0ab154d2db416be43539e38ca4a12f1ccc7910299ce9e0f28580102ec093d7e",
     "scripts/provision.py": "266fc474ab660f6ab6087fe41c5f34512f1273dd530dcb3ded2e19fb6405342c"
   }
 }
