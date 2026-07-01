@@ -45,7 +45,7 @@ PBKDF2_ITERATIONS = 200_000
 
 # 网关版本（单一事实源：app/status 经 /health 拿到的就是它；升级检测靠它比对）
 # 规则：凡改动 gateway.py 行为/结构就 +1；setup.py 不再重复硬编码，改为解析本常量。
-GATEWAY_VERSION = "2.2.1"
+GATEWAY_VERSION = "2.3.0"
 
 # ============ 配置 ============
 
@@ -900,6 +900,74 @@ def _owns_all_sessions(user_id):
     finally:
         conn.close()
     return True
+
+# ============ 按助手名路由到其独立网关端口（/p/<name>/...）============
+# 每个具名助手（含"接管"纳入的已有 bot，如带飞书的 bot2）跑在自己的 api_server 端口上，
+# 端口登记在 ~/.hermes/app-assistants.json（{"assistants":[{"name":..,"port":..}, ..]}）。
+# app 用 /p/<name>/v1/... 与 /p/<name>/api/... 访问该助手；网关据注册表把 name 映射到端口，
+# 转发到 127.0.0.1:<port> 并注入 master key。缺这条路由时具名助手的聊天/会话/搜索都会 404
+# （只有默认助手走裸 /v1、/api 正常）。
+ASSISTANTS_REGISTRY = Path.home() / ".hermes" / "app-assistants.json"
+
+def resolve_assistant_port(name):
+    """助手名 -> 其独立网关端口（来自 app-assistants.json）。未知则 None。"""
+    try:
+        reg = json.loads(ASSISTANTS_REGISTRY.read_text("utf-8"))
+        for a in reg.get("assistants", []):
+            if a.get("name") == name and a.get("port"):
+                return int(a["port"])
+    except Exception:
+        pass
+    return None
+
+def _proxy_to_port(port, sub_path):
+    """把当前请求转发到 127.0.0.1:<port>/<sub_path>（注入 master key，流式返回）。
+    与 proxy_hermes 一致地用 _proxy_headers 剥掉 hop-by-hop 头：否则上游的
+    Content-Length/Transfer-Encoding/Content-Encoding 会和我们重新分块的流式 body 冲突，
+    SSE（/v1/runs/<id>/events）会解析错乱。"""
+    url = f"http://127.0.0.1:{port}/{sub_path}"
+    if request.query_string:
+        url += f"?{request.query_string.decode()}"
+    headers = {
+        'Authorization': f'Bearer {Config.HERMES_API_KEY}',
+        'Content-Type': 'application/json',
+    }
+    try:
+        if request.method == 'GET':
+            resp = requests.get(url, headers=headers, stream=True)
+        else:
+            resp = requests.request(
+                method=request.method,
+                url=url,
+                headers=headers,
+                json=request.json if request.is_json else None,
+                stream=True,
+            )
+        return Response(
+            resp.iter_content(chunk_size=1024),
+            status=resp.status_code,
+            headers=_proxy_headers(resp.headers),
+        )
+    except Exception as e:
+        return jsonify({'error': f'代理请求失败: {str(e)}'}), 500
+
+@app.route('/p/<name>/v1/<path:path>', methods=['GET', 'POST', 'PUT', 'PATCH', 'DELETE'])
+@require_auth
+def proxy_assistant_v1(name, path):
+    """具名助手的 /v1/*（runs/responses/models 等）路由到它的独立端口。"""
+    port = resolve_assistant_port(name)
+    if not port:
+        return jsonify({'error': f'未知助手或未登记端口: {name}'}), 404
+    return _proxy_to_port(port, f"v1/{path}")
+
+@app.route('/p/<name>/api/<path:path>', methods=['GET', 'POST', 'PUT', 'PATCH', 'DELETE'])
+@require_auth
+def proxy_assistant_api(name, path):
+    """具名助手的 /api/*（会话列表/消息/搜索等）路由到它的独立端口。"""
+    port = resolve_assistant_port(name)
+    if not port:
+        return jsonify({'error': f'未知助手或未登记端口: {name}'}), 404
+    return _proxy_to_port(port, f"api/{path}")
 
 @app.route('/v1/<path:path>', methods=['GET', 'POST', 'PUT', 'PATCH', 'DELETE'])
 @require_auth
