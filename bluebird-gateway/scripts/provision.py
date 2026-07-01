@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""manage-assistant provisioner v4 (installed by hermes-app via the default agent).
+"""manage-assistant provisioner v5 (installed by hermes-app via the default agent).
 每个动作打印 [[HAM:BEGIN]]{json}[[HAM:END]] 供 app 解析。
 v4: 每个助手 = 独立 profile + 独立常驻网关(独立 api_server 端口, 复用同一 API key, 关消息平台)。
-    修: gateway.pid 是 JSON 记录(非纯整数)；保留默认网关真实端口；加 stop 动作。"""
+v5: 加"接管已有 bot"(discover/adopt)：纳入用户在 App 之外建的 profile 或独立实例
+    (如带飞书的 bot2, HERMES_HOME=~/.hermes-bot2)。接管=给它开 api_server(复用 master key)
+    并【保留】消息平台 token(与 create 相反)，再登记进注册表。接管记录 adopted=true：
+    删除只从注册表注销(不删实例/不停网关)，禁止 stop(避免断飞书)。状态检查按各自 home。"""
 import json, os, re, sys, signal, subprocess, time, urllib.request
 from pathlib import Path
 
-VERSION = 4
+VERSION = 5
 HOME = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
 PROFILES = HOME / "profiles"
 REGISTRY = HOME / "app-assistants.json"
@@ -131,6 +134,94 @@ def stop_gateway(name):
         try: os.kill(pid, signal.SIGTERM)
         except Exception: pass
 
+# ---- adopt(接管已有 bot) 辅助 ----
+def read_pid_home(home):
+    # 接管的独立实例 pid 文件在它自己的 HERMES_HOME 下，不在 profiles/<name>。
+    try: raw = (Path(home) / "gateway.pid").read_text("utf-8").strip()
+    except Exception: return 0
+    if not raw: return 0
+    try: return int(json.loads(raw)["pid"]) if raw.startswith("{") else int(raw)
+    except Exception: return 0
+
+def list_gateways():
+    # 扫所有在跑的 hermes gateway 进程, 读它们的 HERMES_HOME(经 /proc)。
+    out = []
+    proc = Path("/proc")
+    if not proc.exists(): return out
+    for p in proc.iterdir():
+        if not p.name.isdigit(): continue
+        try: cmd = (p / "cmdline").read_bytes().replace(bytes([0]), b" ").decode("utf-8", "ignore")
+        except Exception: continue
+        if "gateway" not in cmd or "hermes" not in cmd: continue
+        home = ""
+        try:
+            for e in (p / "environ").read_bytes().split(bytes([0])):
+                if e.startswith(b"HERMES_HOME="):
+                    home = e.split(b"=", 1)[1].decode("utf-8", "ignore").rstrip("/"); break
+        except Exception: pass
+        if home: out.append({"pid": int(p.name), "home": home})
+    return out
+
+def detect_api_port(home):
+    # 该实例已配置的 api_server 端口：先 .env, 再 config.yaml(粗解析, 不引 yaml 依赖)。
+    envf = Path(home) / ".env"
+    if envf.exists():
+        for line in envf.read_text("utf-8", "ignore").splitlines():
+            stt = line.strip()
+            if stt.startswith("API_SERVER_PORT="):
+                v = stt.split("=", 1)[1].strip().strip('"').strip("'")
+                if v.isdigit(): return int(v)
+    cfg = Path(home) / "config.yaml"
+    if cfg.exists():
+        in_api = False
+        for line in cfg.read_text("utf-8", "ignore").splitlines():
+            stt = line.strip()
+            indent = len(line) - len(line.lstrip())
+            if stt.startswith("api_server:"): in_api = True; continue
+            if in_api:
+                if stt and indent == 0: in_api = False
+                elif stt.startswith("port:"):
+                    v = stt.split(":", 1)[1].strip().strip('"').strip("'")
+                    if v.isdigit(): return int(v)
+    return 0
+
+def detect_platforms(home):
+    # 仅用于展示:粗扫 .env/config.yaml 里出现过的消息平台前缀。
+    found = set()
+    for fn in (".env", "config.yaml"):
+        f = Path(home) / fn
+        if not f.exists(): continue
+        up = f.read_text("utf-8", "ignore").upper()
+        for pref in PLATFORM_PREFIXES:
+            if pref in up: found.add(pref.rstrip("_"))
+    return sorted(found)
+
+def rewrite_env_adopt(home, port, key):
+    # 接管:开 api_server, 复用 master key——但【保留】消息平台 token(飞书等)。只替换 API_SERVER_*。
+    env = Path(home) / ".env"
+    keep = []
+    if env.exists():
+        for line in env.read_text("utf-8", "ignore").splitlines():
+            s = line.strip()
+            if not s or s.startswith("#"): keep.append(line); continue
+            k = s.split("=", 1)[0].strip()
+            if k.startswith("API_SERVER_"): continue
+            keep.append(line)
+    keep += ["API_SERVER_ENABLED=true", "API_SERVER_KEY=" + key,
+        "API_SERVER_HOST=0.0.0.0", "API_SERVER_PORT=" + str(port)]
+    env.write_text(chr(10).join(keep) + chr(10), encoding="utf-8")
+
+def start_gateway_home(home):
+    # 按指定 HERMES_HOME 拉起网关(接管的独立实例 home 不在 profiles/ 下)。
+    LOGDIR.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ)
+    env["HERMES_HOME"] = home
+    nm = Path(home).name
+    log = open(LOGDIR / (nm + ".log"), "ab")
+    subprocess.Popen(["hermes", "gateway", "run", "--replace"], env=env,
+        stdout=log, stderr=log, stdin=subprocess.DEVNULL,
+        start_new_session=True, cwd=home)
+
 # ---- actions ----
 def act_status():
     emit({"ok": True, "installed": True, "version": VERSION, "count": len(reg_load()["assistants"])})
@@ -138,7 +229,9 @@ def act_status():
 def act_list():
     reg = reg_load()
     for a in reg["assistants"]:
-        a["status"] = "running" if gateway_running(a["name"]) else "stopped"
+        home = a.get("home") or str(profile_dir(a["name"]))
+        pid = read_pid_home(home)
+        a["status"] = "running" if (pid and pid_alive(pid)) else "stopped"
     emit({"ok": True, "assistants": reg["assistants"]})
 
 def act_create(p):
@@ -166,7 +259,8 @@ def act_start(name):
     reg = reg_load()
     rec = next((a for a in reg["assistants"] if a["name"] == name), None)
     if not rec: fail("未找到助手 " + name)
-    start_gateway(name)
+    if rec.get("adopted") and rec.get("home"): start_gateway_home(rec["home"])
+    else: start_gateway(name)
     ok = wait_health(int(rec.get("port") or 0), read_key(), 40)
     rec["status"] = "running" if ok else "starting"
     reg_save(reg)
@@ -176,19 +270,83 @@ def act_stop(name):
     reg = reg_load()
     rec = next((a for a in reg["assistants"] if a["name"] == name), None)
     if not rec: fail("未找到助手 " + name)
+    # 接管的已有 bot:停它的网关会断开飞书等消息平台, 禁止。移出请用 delete(仅注销)。
+    if rec.get("adopted"): fail("该助手是接管的已有 bot, 停止其网关会断开飞书等消息平台, 已禁止")
     stop_gateway(name)
     time.sleep(1)
     rec["status"] = "stopped"; reg_save(reg)
     emit({"ok": True, "name": name, "status": "stopped"})
 
 def act_delete(name):
+    reg = reg_load()
+    rec = next((a for a in reg["assistants"] if a["name"] == name), None)
+    # 接管的已有 bot:只从 App 注册表注销, 绝不停网关/删实例(那会断飞书、毁用户的 bot)。
+    if rec and rec.get("adopted"):
+        reg["assistants"] = [a for a in reg["assistants"] if a["name"] != name]
+        reg_save(reg)
+        emit({"ok": True, "name": name, "unregistered": True})
     stop_gateway(name)
     time.sleep(1)
     run(["hermes", "profile", "delete", name, "-y"])
-    reg = reg_load()
     reg["assistants"] = [a for a in reg["assistants"] if a["name"] != name]
     reg_save(reg)
     emit({"ok": True, "name": name})
+
+def act_discover():
+    # 列出 App 还没纳管的 bot:① 默认 ~/.hermes/profiles 下未登记的 profile;
+    # ② 在跑的独立实例(各自 HERMES_HOME, 经 /proc 找)。供"接管"一键纳入。
+    reg = reg_load()
+    known = set(a["name"] for a in reg["assistants"])
+    seen_homes = set([str(HOME).rstrip("/")])
+    for a in reg["assistants"]:
+        seen_homes.add((a.get("home") or str(profile_dir(a["name"]))).rstrip("/"))
+    cands = []
+    if PROFILES.exists():
+        for d in sorted(PROFILES.iterdir()):
+            if not d.is_dir() or d.name in known: continue
+            seen_homes.add(str(d).rstrip("/"))
+            pid = read_pid_home(str(d))
+            cands.append({"name": d.name, "home": str(d), "kind": "profile",
+                "api_port": detect_api_port(str(d)), "platforms": detect_platforms(str(d)),
+                "gateway_running": bool(pid and pid_alive(pid))})
+    for g in list_gateways():
+        home = g["home"].rstrip("/")
+        if not home or home in seen_homes: continue
+        if any(c["home"].rstrip("/") == home for c in cands): continue
+        base = Path(home).name
+        nm = base[len(".hermes-"):] if base.startswith(".hermes-") else base.lstrip(".")
+        if not NAME_RE.match(nm): nm = re.sub("[^a-z0-9_-]", "-", nm.lower()) or "bot"
+        seen_homes.add(home)
+        cands.append({"name": nm, "home": home, "kind": "standalone", "pid": g["pid"],
+            "api_port": detect_api_port(home), "platforms": detect_platforms(home),
+            "gateway_running": True})
+    emit({"ok": True, "candidates": cands})
+
+def act_adopt(p):
+    # 接管一个已有 bot:开 api_server(复用 master key), 【保留】其消息平台 token, 重启网关, 登记。
+    home = (p.get("home") or "").strip().rstrip("/")
+    name = (p.get("name") or "").strip()
+    if not NAME_RE.match(name): fail("名字不合法(小写字母/数字/连字符, 字母或数字开头)")
+    if not home or not Path(home).exists(): fail("实例目录不存在: " + str(home))
+    reg = reg_load()
+    if any(a["name"] == name for a in reg["assistants"]): fail("已登记同名助手 " + name)
+    if any((a.get("home") or "").rstrip("/") == home for a in reg["assistants"]): fail("该实例已被接管")
+    key = read_key()
+    if not key: fail("默认网关未配置 API_SERVER_KEY, 无法复用鉴权")
+    port = detect_api_port(home) or next_port(reg)
+    rewrite_env_adopt(home, port, key)
+    start_gateway_home(home)
+    ok = wait_health(port, key, 40)
+    soul = ""
+    sp = Path(home) / "SOUL.md"
+    if sp.exists():
+        try: soul = sp.read_text("utf-8", "ignore").strip()[:40]
+        except Exception: pass
+    rec = {"name": name, "model": "", "port": port, "host": "0.0.0.0",
+        "status": "running" if ok else "starting", "soul_preview": soul,
+        "home": home, "adopted": True, "platforms": detect_platforms(home)}
+    reg["assistants"].append(rec); reg_save(reg)
+    emit({"ok": True, "name": name, "port": port, "status": rec["status"], "adopted": True})
 
 def main():
     a = sys.argv[1] if len(sys.argv) > 1 else "status"
@@ -199,6 +357,8 @@ def main():
         elif a == "start": act_start(sys.argv[2])
         elif a == "stop": act_stop(sys.argv[2])
         elif a == "delete": act_delete(sys.argv[2])
+        elif a == "discover": act_discover()
+        elif a == "adopt": act_adopt(json.loads(Path(sys.argv[2]).read_text("utf-8")))
         else: fail("未知动作 " + a)
     except Exception as e: fail(e)
 
