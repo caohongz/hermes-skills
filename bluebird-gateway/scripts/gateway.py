@@ -45,7 +45,7 @@ PBKDF2_ITERATIONS = 200_000
 
 # 网关版本（单一事实源：app/status 经 /health 拿到的就是它；升级检测靠它比对）
 # 规则：凡改动 gateway.py 行为/结构就 +1；setup.py 不再重复硬编码，改为解析本常量。
-GATEWAY_VERSION = "2.3.0"
+GATEWAY_VERSION = "2.4.0"
 
 # ============ 配置 ============
 
@@ -70,11 +70,12 @@ class Config:
     # 留空则纯 HTTP（由前面的 Caddy/nginx/tailscale serve 负责 TLS）。
     SSL_CERTFILE = None
     SSL_KEYFILE = None
-    # 多用户授权加固（默认关闭，避免影响现有 app；按 SKILL.md 验证 app 请求结构后再开）：
-    #   enforce_session_ownership: /v1,/api 转发前，请求里出现的会话标识若在 sessions 表中
-    #     属于他人则 403（无法识别的标识放行，不破坏功能）。
+    # 多用户按会话隔离（Phase A，默认开启；可在 config.json 置 false 灰度回退）：
+    #   enforce_session_ownership: 单 master key 之上把每个会话/运行绑定到发起用户；之后任何
+    #     携带他人会话/运行标识的读写一律 403；GET /api/sessions 列表与 search 仅回本人拥有的。
+    #     未登记标识（cron/telegram 等系统线程）放行，但不进入任何人的列表。
     #   api_allow_prefixes: 非空时 /api/* 仅放行这些路径前缀（白名单），其余 403。
-    ENFORCE_SESSION_OWNERSHIP = False
+    ENFORCE_SESSION_OWNERSHIP = True
     API_ALLOW_PREFIXES = []
 
     @classmethod
@@ -98,7 +99,8 @@ class Config:
                 cls.JWT_SECRET = config.get('jwt_secret')
                 cls.SSL_CERTFILE = config.get('ssl_certfile') or None
                 cls.SSL_KEYFILE = config.get('ssl_keyfile') or None
-                cls.ENFORCE_SESSION_OWNERSHIP = bool(config.get('enforce_session_ownership', False))
+                # 缺省时取类默认（True）→ 新库/未显式配置即安全默认开启；显式 false 才关。
+                cls.ENFORCE_SESSION_OWNERSHIP = bool(config.get('enforce_session_ownership', cls.ENFORCE_SESSION_OWNERSHIP))
                 cls.API_ALLOW_PREFIXES = config.get('api_allow_prefixes') or []
 
         # 如果没有配置，尝试从环境变量读取
@@ -143,7 +145,7 @@ class Config:
 # 数据库结构版本：每次给「已存在的表」加列/改结构时 +1，并在 MIGRATIONS 登记对应迁移。
 # 约定：init_db 的 CREATE TABLE 永远反映「最新结构」；迁移只负责把历史库逐级升到最新。
 # 因此全新库（CREATE TABLE 已是最新）跑迁移应是幂等 no-op，迁移函数务必自带存在性检查。
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 def _column_exists(conn, table, column):
     """表里是否已有该列（供迁移做幂等判断）。"""
@@ -168,7 +170,17 @@ def _mig_add_token_version(conn):
     if not _column_exists(conn, "users", "token_version"):
         conn.execute("ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0")
 
-MIGRATIONS = {2: _mig_add_token_version}
+def _mig_add_ownership_tables(conn):
+    """v3：会话/运行归属表（Phase A 按用户隔离）。均为 CREATE IF NOT EXISTS → 幂等。"""
+    conn.execute("""CREATE TABLE IF NOT EXISTS session_owners (
+        session_id TEXT PRIMARY KEY, user_id INTEGER NOT NULL,
+        profile TEXT DEFAULT '', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS run_owners (
+        run_id TEXT PRIMARY KEY, user_id INTEGER NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_session_owners_user ON session_owners(user_id)")
+
+MIGRATIONS = {2: _mig_add_token_version, 3: _mig_add_ownership_tables}
 
 def run_migrations(conn):
     """把数据库结构从当前版本逐级升到 SCHEMA_VERSION；全新库与历史库都安全。"""
@@ -248,7 +260,27 @@ def init_db():
         )
     """)
 
+    # 会话/运行归属（Phase A 按用户隔离）：谁发起(run/responses)谁认领，之后跨用户读写 403，
+    # GET /api/sessions 列表与 search 仅回本人拥有的。原 sessions 表已不再由网关自管
+    # （改为透传 Hermes），保留不用。
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS session_owners (
+            session_id TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            profile TEXT DEFAULT '',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS run_owners (
+            run_id TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
     # 创建索引
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_session_owners_user ON session_owners(user_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_devices_user_id ON devices(user_id)")
@@ -609,7 +641,7 @@ def admin_list_users():
     conn = get_db()
     users = conn.execute('''
         SELECT u.id, u.username, u.display_name, u.email, u.role, u.created_at, u.last_login,
-               (SELECT COUNT(*) FROM sessions WHERE user_id = u.id AND archived = 0) as session_count
+               (SELECT COUNT(*) FROM session_owners WHERE user_id = u.id) as session_count
         FROM users u
         ORDER BY u.role DESC, u.created_at ASC
     ''').fetchall()
@@ -759,99 +791,10 @@ def admin_reset_password(user_id):
         'message': f'用户 {user["username"]} 的密码已重置，其已登录设备需重新登录'
     })
 
-# ============ 会话管理 API ============
-
-@app.route('/api/sessions', methods=['GET'])
-@require_auth
-def list_sessions():
-    """获取当前用户的会话列表（管理员也只能看到自己的）"""
-    user_id = request.current_user['id']
-
-    conn = get_db()
-    sessions = conn.execute(
-        '''SELECT * FROM sessions
-           WHERE user_id = ? AND archived = 0
-           ORDER BY pinned DESC, updated_at DESC''',
-        (user_id,)
-    ).fetchall()
-    conn.close()
-
-    return jsonify([dict(s) for s in sessions])
-
-@app.route('/api/sessions', methods=['POST'])
-@require_auth
-def create_session():
-    """创建新会话"""
-    user_id = request.current_user['id']
-    data = request.json
-
-    session_id = data.get('id')
-    hermes_session_id = data.get('hermes_session_id', session_id)
-    title = data.get('title', 'New Chat')
-    profile = data.get('profile', '')
-
-    conn = get_db()
-    conn.execute(
-        '''INSERT INTO sessions (id, user_id, hermes_session_id, title, profile)
-           VALUES (?, ?, ?, ?, ?)''',
-        (session_id, user_id, hermes_session_id, title, profile)
-    )
-    conn.commit()
-    conn.close()
-
-    return jsonify({'id': session_id, 'hermes_session_id': hermes_session_id})
-
-@app.route('/api/sessions/<session_id>', methods=['PATCH'])
-@require_auth
-def update_session(session_id):
-    """更新会话"""
-    user_id = request.current_user['id']
-    data = request.json
-
-    updates = []
-    params = []
-
-    if 'title' in data:
-        updates.append('title = ?')
-        params.append(data['title'])
-    if 'pinned' in data:
-        updates.append('pinned = ?')
-        params.append(1 if data['pinned'] else 0)
-    if 'archived' in data:
-        updates.append('archived = ?')
-        params.append(1 if data['archived'] else 0)
-    if 'preview' in data:
-        updates.append('preview = ?')
-        params.append(data['preview'])
-
-    if not updates:
-        return jsonify({'error': '没有可更新的字段'}), 400
-
-    updates.append('updated_at = CURRENT_TIMESTAMP')
-    params.extend([session_id, user_id])
-
-    conn = get_db()
-    conn.execute(
-        f'UPDATE sessions SET {", ".join(updates)} WHERE id = ? AND user_id = ?',
-        params
-    )
-    conn.commit()
-    conn.close()
-
-    return jsonify({'success': True})
-
-@app.route('/api/sessions/<session_id>', methods=['DELETE'])
-@require_auth
-def delete_session(session_id):
-    """删除会话"""
-    user_id = request.current_user['id']
-
-    conn = get_db()
-    conn.execute('DELETE FROM sessions WHERE id = ? AND user_id = ?', (session_id, user_id))
-    conn.commit()
-    conn.close()
-
-    return jsonify({'success': True})
+# ============ 会话管理：改为透传 Hermes ============
+# 旧版网关自管一张 sessions 元数据表（list/create/update/delete）。app 新模型里会话真身在
+# Hermes :8642 的 /api/sessions/*（列表/消息/搜索/改名/归档/删除），且 app 从不写网关这张表。
+# 故移除这些自管路由：请求落到下方 proxy_hermes_api，由它透传 Hermes 并按用户做归属过滤/守卫。
 
 # ============ Hermes 代理 ============
 
@@ -866,40 +809,104 @@ _HOP_BY_HOP = {
 def _proxy_headers(headers):
     return [(k, v) for k, v in headers.items() if k.lower() not in _HOP_BY_HOP]
 
-def _request_session_ids():
-    """尽力从 body/query 提取可能的会话标识，用于 opt-in 归属校验。"""
-    ids = set()
-    try:
-        body = request.get_json(silent=True)
-        if isinstance(body, dict):
-            for k in ('hermes_session_id', 'session_id', 'session', 'sessionId'):
-                v = body.get(k)
-                if isinstance(v, str) and v:
-                    ids.add(v)
-    except Exception:
-        pass
-    for k in ('hermes_session_id', 'session_id', 'session'):
-        v = request.args.get(k)
-        if v:
-            ids.add(v)
-    return ids
+# ============ 会话/运行归属（Phase A：单 master key 之上按用户隔离）============
+# Hermes 每实例只有一份全局会话库，且网关注入同一把 master key → Hermes 无法区分用户。
+# 故在网关层维护 session/run -> user：谁发起(POST /v1/runs、/v1/responses)谁认领；之后任何
+# 携带他人会话/运行标识的读写一律 403；GET /api/sessions 列表与 search 仅回本人拥有的。
+# 归属只由"发起动作"建立，读操作只校验不认领；未登记标识(cron/telegram 等系统线程)放行，
+# 但不进入任何人的列表。总开关：Config.ENFORCE_SESSION_OWNERSHIP。
 
-def _owns_all_sessions(user_id):
-    """opt-in 归属校验：请求中可识别的会话若属于他人则返回 False；无法识别的标识放行（不破坏功能）。"""
-    ids = _request_session_ids()
-    if not ids:
-        return True
+def _owner_of_session(session_id):
+    """会话属主 user_id；未登记返回 None。"""
+    if not session_id:
+        return None
     conn = get_db()
     try:
-        for sid in ids:
-            row = conn.execute(
-                'SELECT user_id FROM sessions WHERE id = ? OR hermes_session_id = ?',
-                (sid, sid)).fetchone()
-            if row and row['user_id'] != user_id:
-                return False
+        row = conn.execute('SELECT user_id FROM session_owners WHERE session_id = ?',
+                           (session_id,)).fetchone()
+        return row['user_id'] if row else None
     finally:
         conn.close()
-    return True
+
+def _claim_session(session_id, user_id, profile=''):
+    """首次触达认领（已属他人则不覆盖，INSERT OR IGNORE 保证原子）。"""
+    if not session_id:
+        return
+    conn = get_db()
+    try:
+        conn.execute(
+            'INSERT OR IGNORE INTO session_owners (session_id, user_id, profile) VALUES (?, ?, ?)',
+            (session_id, user_id, profile or ''))
+        conn.commit()
+    finally:
+        conn.close()
+
+def _owner_of_run(run_id):
+    """运行属主 user_id；未登记返回 None。"""
+    if not run_id:
+        return None
+    conn = get_db()
+    try:
+        row = conn.execute('SELECT user_id FROM run_owners WHERE run_id = ?',
+                           (run_id,)).fetchone()
+        return row['user_id'] if row else None
+    finally:
+        conn.close()
+
+def _claim_run(run_id, user_id):
+    if not run_id:
+        return
+    conn = get_db()
+    try:
+        conn.execute('INSERT OR IGNORE INTO run_owners (run_id, user_id) VALUES (?, ?)',
+                     (run_id, user_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+def _owned_session_ids(user_id):
+    """当前用户拥有的全部会话 id 集合（供列表/搜索过滤）。"""
+    conn = get_db()
+    try:
+        return {r['session_id'] for r in conn.execute(
+            'SELECT session_id FROM session_owners WHERE user_id = ?', (user_id,)).fetchall()}
+    finally:
+        conn.close()
+
+def _body_session_id():
+    """从 body/header 尽力取会话标识（runs:session_id；responses:conversation）。"""
+    try:
+        b = request.get_json(silent=True)
+        if isinstance(b, dict):
+            for k in ('session_id', 'hermes_session_id', 'conversation', 'session', 'sessionId'):
+                v = b.get(k)
+                if isinstance(v, str) and v:
+                    return v
+    except Exception:
+        pass
+    v = request.headers.get('X-Hermes-Session-Id')
+    return v or None
+
+def _item_session_ids(item):
+    """一条会话/搜索结果里可能承载会话 id 的字段（列表多用 id，搜索命中多用 session_id）。"""
+    if not isinstance(item, dict):
+        return []
+    return [item[k] for k in ('id', 'session_id', 'sessionId')
+            if isinstance(item.get(k), str) and item.get(k)]
+
+def _filter_owned_list(payload, owned):
+    """把 Hermes 的会话/搜索结果过滤为仅本人拥有的项；兼容数组或 {sessions|data|results|hits}。"""
+    def keep(item):
+        return any(sid in owned for sid in _item_session_ids(item))
+    if isinstance(payload, list):
+        return [x for x in payload if keep(x)]
+    if isinstance(payload, dict):
+        for k in ('sessions', 'data', 'results', 'hits'):
+            if isinstance(payload.get(k), list):
+                out = dict(payload)
+                out[k] = [x for x in payload[k] if keep(x)]
+                return out
+    return payload
 
 # ============ 按助手名路由到其独立网关端口（/p/<name>/...）============
 # 每个具名助手（含"接管"纳入的已有 bot，如带飞书的 bot2）跑在自己的 api_server 端口上，
@@ -972,36 +979,57 @@ def proxy_assistant_api(name, path):
 @app.route('/v1/<path:path>', methods=['GET', 'POST', 'PUT', 'PATCH', 'DELETE'])
 @require_auth
 def proxy_hermes(path):
-    """代理 Hermes API 请求"""
-    # opt-in 会话归属校验（默认关闭；开启后阻断可识别的跨用户会话访问）
-    if Config.ENFORCE_SESSION_OWNERSHIP and not _owns_all_sessions(request.current_user['id']):
-        return jsonify({'error': '无权访问该会话'}), 403
-    # 构建目标 URL
-    url = f"{Config.HERMES_URL}/v1/{path}"
+    """代理 Hermes /v1/*（默认助手）。按用户做会话/运行归属校验与认领。"""
+    uid = request.current_user['id']
+    seg = path.split('/')
+    capture_runs = False
+    if Config.ENFORCE_SESSION_OWNERSHIP:
+        # /v1/runs/<run_id>/...（events/stop/approval/get）：校验运行归属
+        if seg[0] == 'runs' and len(seg) >= 2 and seg[1]:
+            owner = _owner_of_run(seg[1])
+            if owner is not None and owner != uid:
+                return jsonify({'error': '无权访问该运行'}), 403
+        # 创建运行/响应：按 body 里的会话标识先校验、再认领
+        if request.method == 'POST' and path in ('runs', 'responses'):
+            sid = _body_session_id()
+            if sid:
+                owner = _owner_of_session(sid)
+                if owner is not None and owner != uid:
+                    return jsonify({'error': '无权访问该会话'}), 403
+                _claim_session(sid, uid)
+            capture_runs = (path == 'runs')
 
-    # 复制查询参数
+    url = f"{Config.HERMES_URL}/v1/{path}"
     if request.query_string:
         url += f"?{request.query_string.decode()}"
-
-    # 准备请求头（注入 master key）
     headers = {
         'Authorization': f'Bearer {Config.HERMES_API_KEY}',
         'Content-Type': 'application/json',
     }
 
-    # 转发请求
     try:
+        if capture_runs:
+            # POST /v1/runs 的响应是小 JSON（run_id/session_id）：缓冲登记归属，再原样返回。
+            resp = requests.request(
+                method=request.method, url=url, headers=headers,
+                json=request.json if request.is_json else None)
+            try:
+                j = resp.json()
+                if isinstance(j, dict):
+                    _claim_run(j.get('run_id') or j.get('id'), uid)
+                    srv_sid = j.get('session_id') or j.get('sessionId')
+                    if srv_sid:
+                        _claim_session(srv_sid, uid)
+            except Exception:
+                pass
+            return Response(resp.content, status=resp.status_code,
+                            headers=_proxy_headers(resp.headers))
         if request.method == 'GET':
             resp = requests.get(url, headers=headers, stream=True)
         else:
             resp = requests.request(
-                method=request.method,
-                url=url,
-                headers=headers,
-                json=request.json,
-                stream=True
-            )
-
+                method=request.method, url=url, headers=headers,
+                json=request.json if request.is_json else None, stream=True)
         # 返回响应（保持流式传输）
         return Response(
             resp.iter_content(chunk_size=1024),
@@ -1014,43 +1042,63 @@ def proxy_hermes(path):
 @app.route('/api/<path:path>', methods=['GET', 'POST', 'PUT', 'PATCH', 'DELETE'])
 @require_auth
 def proxy_hermes_api(path):
-    """代理 Hermes /api/* 请求"""
-    # 不代理网关自己的 API
-    if path.startswith('auth/') or path.startswith('sessions') or path.startswith('admin/'):
+    """代理 Hermes /api/*（含会话列表/消息/搜索）。按用户做归属校验与列表过滤。"""
+    uid = request.current_user['id']
+    # 网关自己的账号/管理接口不代理（sessions 现改为透传 Hermes，故不再整体拦截）
+    if path.startswith('auth/') or path.startswith('admin/'):
         return jsonify({'error': '无效的路径'}), 404
 
-    # 助手管理相关的路径需要管理员权限
+    # 助手/画像管理相关路径需要管理员
     if path.startswith('assistants') or path.startswith('profiles'):
-        current_user = request.current_user
-        if current_user['role'] != 'admin':
+        if request.current_user['role'] != 'admin':
             return jsonify({'error': '只有管理员可以管理助手'}), 403
+
+    seg = path.split('/')
+    is_sessions = seg[0] == 'sessions'
+    list_or_search = is_sessions and path in ('sessions', 'sessions/search')
+    # 单会话读写：/api/sessions/<id> 或 /api/sessions/<id>/messages（排除 search/prune）
+    single_id = seg[1] if (is_sessions and len(seg) >= 2 and seg[1] not in ('', 'search', 'prune')) else None
+
+    if Config.ENFORCE_SESSION_OWNERSHIP:
+        # prune 会全局删旧会话（跨用户）→ 仅管理员
+        if is_sessions and len(seg) >= 2 and seg[1] == 'prune' and request.current_user['role'] != 'admin':
+            return jsonify({'error': '仅管理员可批量清理会话'}), 403
+        if single_id is not None:
+            owner = _owner_of_session(single_id)
+            if owner is not None and owner != uid:
+                return jsonify({'error': '无权访问该会话'}), 403
 
     # opt-in 白名单（默认空=不启用）：仅放行配置的前缀，其余拒绝
     if Config.API_ALLOW_PREFIXES and not any(path.startswith(p) for p in Config.API_ALLOW_PREFIXES):
         return jsonify({'error': '该接口未在白名单内'}), 403
 
-    # opt-in 会话归属校验（默认关闭）
-    if Config.ENFORCE_SESSION_OWNERSHIP and not _owns_all_sessions(request.current_user['id']):
-        return jsonify({'error': '无权访问该会话'}), 403
-
     url = f"{Config.HERMES_URL}/api/{path}"
     if request.query_string:
         url += f"?{request.query_string.decode()}"
-
     headers = {
         'Authorization': f'Bearer {Config.HERMES_API_KEY}',
         'Content-Type': 'application/json',
     }
 
+    # 会话列表/搜索：缓冲响应并过滤为本人拥有的会话（防止共享默认助手泄露他人列表）
+    if Config.ENFORCE_SESSION_OWNERSHIP and request.method == 'GET' and list_or_search:
+        try:
+            resp = requests.request(method='GET', url=url, headers=headers)
+        except Exception as e:
+            return jsonify({'error': f'代理请求失败: {str(e)}'}), 500
+        try:
+            payload = _filter_owned_list(resp.json(), _owned_session_ids(uid))
+            return jsonify(payload), resp.status_code
+        except Exception:
+            # 非 JSON / 形状意外：为不泄露，回空列表而非原样透传
+            return jsonify([]), resp.status_code
+
     try:
         resp = requests.request(
-            method=request.method,
-            url=url,
-            headers=headers,
-            json=request.json if request.method != 'GET' else None,
+            method=request.method, url=url, headers=headers,
+            json=request.json if (request.method != 'GET' and request.is_json) else None,
             stream=True
         )
-
         return Response(
             resp.iter_content(chunk_size=1024),
             status=resp.status_code,
@@ -1158,8 +1206,8 @@ def admin_stats():
     stats = {
         'total_users': conn.execute('SELECT COUNT(*) FROM users').fetchone()[0],
         'admin_count': conn.execute("SELECT COUNT(*) FROM users WHERE role = 'admin'").fetchone()[0],
-        'total_sessions': conn.execute('SELECT COUNT(*) FROM sessions').fetchone()[0],
-        'active_sessions': conn.execute('SELECT COUNT(*) FROM sessions WHERE archived = 0').fetchone()[0],
+        'total_sessions': conn.execute('SELECT COUNT(*) FROM session_owners').fetchone()[0],
+        'active_sessions': conn.execute('SELECT COUNT(*) FROM session_owners').fetchone()[0],
         'total_devices': conn.execute('SELECT COUNT(*) FROM devices').fetchone()[0],
     }
 
