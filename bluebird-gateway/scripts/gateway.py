@@ -45,7 +45,7 @@ PBKDF2_ITERATIONS = 200_000
 
 # 网关版本（单一事实源：app/status 经 /health 拿到的就是它；升级检测靠它比对）
 # 规则：凡改动 gateway.py 行为/结构就 +1；setup.py 不再重复硬编码，改为解析本常量。
-GATEWAY_VERSION = "2.4.0"
+GATEWAY_VERSION = "2.4.2"
 
 # ============ 配置 ============
 
@@ -581,7 +581,8 @@ def login():
             'id': user['id'],
             'username': user['username'],
             'display_name': user['display_name'],
-            'email': user['email']
+            'email': user['email'],
+            'role': user['role'],
         },
         **tokens
     })
@@ -895,18 +896,23 @@ def _item_session_ids(item):
             if isinstance(item.get(k), str) and item.get(k)]
 
 def _filter_owned_list(payload, owned):
-    """把 Hermes 的会话/搜索结果过滤为仅本人拥有的项；兼容数组或 {sessions|data|results|hits}。"""
+    """把 Hermes 的会话/搜索结果过滤为仅本人拥有的项。
+    fail-closed：识别不出承载会话的结构时回空列表，绝不原样透传（否则等于泄露全部）。
+    键名不再写死为 sessions|data|results|hits——自动定位「值是数组、元素含 id 类字段」的键，
+    兼容 Hermes 各版本形状（例如实测顶层会话数组键名与预期不符曾导致过滤被整包跳过）。"""
     def keep(item):
         return any(sid in owned for sid in _item_session_ids(item))
     if isinstance(payload, list):
         return [x for x in payload if keep(x)]
     if isinstance(payload, dict):
-        for k in ('sessions', 'data', 'results', 'hits'):
-            if isinstance(payload.get(k), list):
+        for k, v in payload.items():
+            if isinstance(v, list) and (not v or (isinstance(v[0], dict)
+                    and any(kk in v[0] for kk in ('id', 'session_id', 'sessionId')))):
                 out = dict(payload)
-                out[k] = [x for x in payload[k] if keep(x)]
+                out[k] = [x for x in v if keep(x)]
                 return out
-    return payload
+    # 结构不认识：安全起见回空，绝不把未过滤的整包透传出去
+    return []
 
 # ============ 按助手名路由到其独立网关端口（/p/<name>/...）============
 # 每个具名助手（含"接管"纳入的已有 bot，如带飞书的 bot2）跑在自己的 api_server 端口上，
@@ -1065,7 +1071,12 @@ def proxy_hermes_api(path):
             return jsonify({'error': '仅管理员可批量清理会话'}), 403
         if single_id is not None:
             owner = _owner_of_session(single_id)
-            if owner is not None and owner != uid:
+            # fail-closed：无主会话（认领缺失或对不上 Hermes 真实 id）默认只有管理员可读写，
+            # 普通用户一律拒绝；有主则必须是本人。杜绝"认领没对上→无主→放行"造成的越权。
+            if owner is None:
+                if request.current_user['role'] != 'admin':
+                    return jsonify({'error': '无权访问该会话'}), 403
+            elif owner != uid:
                 return jsonify({'error': '无权访问该会话'}), 403
 
     # opt-in 白名单（默认空=不启用）：仅放行配置的前缀，其余拒绝
